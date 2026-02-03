@@ -16,18 +16,101 @@ extern int resample_to_44100_if_needed(int16_t **data, uint32_t *sample_count,
 extern struct sfPresetHeader *sf2_get_preset(struct SF2Bank *bank, int bank_num, int preset_num);
 extern struct sfPresetHeader *sf2_get_first_preset(struct SF2Bank *bank);
 
-/* Convert SF2 timecents to WaveFront time value (0-127) */
-static uint8_t timecents_to_wf(int16_t timecents) {
-    /* SF2 timecents: -12000 to 8000 (log2 seconds * 1200)
-     * WaveFront: 0-127 linear approximation */
-    if (timecents < -12000) timecents = -12000;
-    if (timecents > 8000) timecents = 8000;
+static uint64_t hash_pcm_data(const int16_t *data, uint32_t samples) {
+    const uint8_t *bytes = (const uint8_t *)data;
+    uint64_t hash = 1469598103934665603ULL;
+    uint32_t total_bytes = samples * sizeof(int16_t);
+    for (uint32_t i = 0; i < total_bytes; i++) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
 
-    /* Simple mapping - could be refined */
-    int value = (timecents + 12000) * 127 / 20000;
-    if (value < 0) value = 0;
-    if (value > 127) value = 127;
-    return (uint8_t)value;
+static int sample_offsets_equal(const struct SAMPLE_OFFSET *a, const struct SAMPLE_OFFSET *b) {
+    return a->fInteger == b->fInteger && a->fFraction == b->fFraction;
+}
+
+static int g_dedupe_alias_count = 0;
+static const float wf_time_table[128] = {
+    0.0f, 0.008f, 0.009f, 0.010f, 0.012f, 0.013f, 0.015f, 0.016f,
+    0.018f, 0.020f, 0.022f, 0.024f, 0.026f, 0.029f, 0.031f, 0.034f,
+    0.037f, 0.041f, 0.044f, 0.048f, 0.052f, 0.056f, 0.061f, 0.066f,
+    0.071f, 0.076f, 0.083f, 0.089f, 0.096f, 0.103f, 0.111f, 0.120f,
+    0.129f, 0.139f, 0.150f, 0.161f, 0.173f, 0.186f, 0.200f, 0.215f,
+    0.231f, 0.248f, 0.266f, 0.286f, 0.307f, 0.330f, 0.354f, 0.380f,
+    0.408f, 0.438f, 0.470f, 0.504f, 0.541f, 0.580f, 0.622f, 0.668f,
+    0.716f, 0.768f, 0.824f, 0.883f, 0.947f, 1.016f, 1.089f, 1.168f,
+    1.253f, 1.343f, 1.440f, 1.544f, 1.655f, 1.775f, 1.903f, 2.040f,
+    2.187f, 2.345f, 2.513f, 2.694f, 2.888f, 3.096f, 3.319f, 3.558f,
+    3.814f, 4.088f, 4.382f, 4.697f, 5.035f, 5.397f, 5.785f, 6.200f,
+    6.646f, 7.124f, 7.635f, 8.184f, 8.772f, 9.402f, 10.078f, 10.801f,
+    11.577f, 12.409f, 13.300f, 14.255f, 15.279f, 16.376f, 17.552f, 18.812f,
+    20.163f, 21.611f, 23.162f, 24.826f, 26.608f, 28.518f, 30.566f, 32.760f,
+    35.112f, 37.633f, 40.334f, 43.230f, 46.333f, 49.659f, 53.224f, 57.044f,
+    61.139f, 65.528f, 70.232f, 75.273f, 80.676f, 86.467f, 92.674f, 99.326f
+};
+
+static const float wf_lfo_freq_table[128] = {
+    0.0f, 0.0172f, 0.0182f, 0.0194f, 0.0206f, 0.0218f, 0.0232f, 0.0246f,
+    0.0261f, 0.0277f, 0.0294f, 0.0312f, 0.0331f, 0.0351f, 0.0373f, 0.0396f,
+    0.0420f, 0.0446f, 0.0473f, 0.0502f, 0.0533f, 0.0566f, 0.0601f, 0.0637f,
+    0.0676f, 0.0718f, 0.0762f, 0.0809f, 0.0859f, 0.0911f, 0.0967f, 0.1026f,
+    0.1089f, 0.1156f, 0.1227f, 0.1303f, 0.1383f, 0.1467f, 0.1558f, 0.1653f,
+    0.1755f, 0.1862f, 0.1977f, 0.2098f, 0.2227f, 0.2363f, 0.2508f, 0.2662f,
+    0.2826f, 0.2999f, 0.3183f, 0.3379f, 0.3586f, 0.3806f, 0.4040f, 0.4288f,
+    0.4551f, 0.4830f, 0.5127f, 0.5441f, 0.5775f, 0.6130f, 0.6506f, 0.6905f,
+    0.7329f, 0.7779f, 0.8256f, 0.8763f, 0.9301f, 0.9872f, 1.0478f, 1.1121f,
+    1.1804f, 1.2528f, 1.3297f, 1.4113f, 1.4979f, 1.5899f, 1.6875f, 1.7910f,
+    1.9010f, 2.0176f, 2.1415f, 2.2729f, 2.4124f, 2.5605f, 2.7176f, 2.8844f,
+    3.0615f, 3.2494f, 3.4488f, 3.6605f, 3.8852f, 4.1236f, 4.3767f, 4.6453f,
+    4.9305f, 5.2331f, 5.5543f, 5.8952f, 6.2570f, 6.6410f, 7.0486f, 7.4813f,
+    7.9405f, 8.4278f, 8.9451f, 9.4941f, 10.076f, 10.695f, 11.352f, 12.048f,
+    12.788f, 13.573f, 14.406f, 15.290f, 16.229f, 17.225f, 18.282f, 19.404f,
+    20.595f, 21.859f, 23.201f, 24.625f, 26.136f, 27.740f, 29.443f, 31.250f
+};
+
+static float sf2_timecents_to_seconds(int16_t timecents) {
+    if (timecents <= -32768) {
+        return 0.0f;
+    }
+    return powf(2.0f, (float)timecents / 1200.0f);
+}
+
+static float sf2_cents_to_hz(int16_t cents) {
+    return 8.176f * powf(2.0f, (float)cents / 1200.0f);
+}
+
+static uint8_t wf_time_from_seconds(float seconds) {
+    if (seconds <= 0.0f) {
+        return 0;
+    }
+    float best_diff = fabsf(wf_time_table[0] - seconds);
+    uint8_t best_idx = 0;
+    for (uint8_t i = 1; i < 128; i++) {
+        float diff = fabsf(wf_time_table[i] - seconds);
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+static uint8_t wf_lfo_freq_from_hz(float hz) {
+    if (hz <= 0.0f) {
+        return 0;
+    }
+    float best_diff = fabsf(wf_lfo_freq_table[0] - hz);
+    uint8_t best_idx = 0;
+    for (uint8_t i = 1; i < 128; i++) {
+        float diff = fabsf(wf_lfo_freq_table[i] - hz);
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_idx = i;
+        }
+    }
+    return best_idx;
 }
 
 /* Convert SF2 centibels to WaveFront level (-128 to 127) */
@@ -44,6 +127,29 @@ static int8_t centibels_to_level(int16_t centibels) {
 static int16_t cents_to_freq_bias(int16_t cents) {
     /* Approximate conversion */
     return cents;
+}
+
+static int8_t cents_to_amount(int16_t cents, int16_t scale) {
+    int value = cents / scale;
+    if (value < -127) value = -127;
+    if (value > 127) value = 127;
+    return (int8_t)value;
+}
+
+static int8_t centibels_to_amount(int16_t centibels, int16_t scale) {
+    int value = centibels / scale;
+    if (value < -127) value = -127;
+    if (value > 127) value = 127;
+    return (int8_t)value;
+}
+
+static int8_t mod_env_sustain_to_level(int16_t sustain_permille) {
+    if (sustain_permille < 0) sustain_permille = 0;
+    if (sustain_permille > 1000) sustain_permille = 1000;
+    int level = 127 - (sustain_permille * 127) / 1000;
+    if (level < -127) level = -127;
+    if (level > 127) level = 127;
+    return (int8_t)level;
 }
 
 /* Initialize default envelope */
@@ -81,46 +187,443 @@ static void init_default_patch(struct PATCH *patch) {
     init_default_lfo(&patch->lfo2);
 }
 
-/* Parse SF2 generators and apply to patch */
-static void apply_generators(struct PATCH *patch, struct SF2Bank *sf2,
-                            int gen_start, int gen_end) {
-    int i;
+struct Sf2GenState {
+    int16_t mod_lfo_to_pitch;
+    int16_t vib_lfo_to_pitch;
+    int16_t mod_env_to_pitch;
+    int16_t initial_filter_fc;
+    int16_t mod_lfo_to_filter_fc;
+    int16_t mod_env_to_filter_fc;
+    int16_t mod_lfo_to_volume;
+    int16_t delay_mod_lfo;
+    int16_t freq_mod_lfo;
+    int16_t delay_vib_lfo;
+    int16_t freq_vib_lfo;
+    int16_t delay_mod_env;
+    int16_t attack_mod_env;
+    int16_t hold_mod_env;
+    int16_t decay_mod_env;
+    int16_t sustain_mod_env;
+    int16_t release_mod_env;
+    int16_t delay_vol_env;
+    int16_t attack_vol_env;
+    int16_t hold_vol_env;
+    int16_t decay_vol_env;
+    int16_t sustain_vol_env;
+    int16_t release_vol_env;
+    int16_t initial_attenuation;
+    int16_t coarse_tune;
+    int16_t fine_tune;
+    int16_t pan;
+    int16_t exclusive_class;
+};
 
-    for (i = gen_start; i < gen_end; i++) {
-        struct sfInstGenList *gen = &sf2->inst_gens[i];
+static void sf2_gen_defaults(struct Sf2GenState *state) {
+    memset(state, 0, sizeof(*state));
+    state->initial_filter_fc = 13500;
+    state->delay_mod_lfo = -12000;
+    state->freq_mod_lfo = 0;
+    state->delay_vib_lfo = -12000;
+    state->freq_vib_lfo = 0;
+    state->delay_mod_env = -12000;
+    state->attack_mod_env = -12000;
+    state->hold_mod_env = -12000;
+    state->decay_mod_env = -12000;
+    state->sustain_mod_env = 0;
+    state->release_mod_env = -12000;
+    state->delay_vol_env = -12000;
+    state->attack_vol_env = -12000;
+    state->hold_vol_env = -12000;
+    state->decay_vol_env = -12000;
+    state->sustain_vol_env = 0;
+    state->release_vol_env = -12000;
+    state->initial_attenuation = 0;
+    state->pan = 0;
+    state->exclusive_class = 0;
+}
 
+static void sf2_apply_generators(struct Sf2GenState *state, struct sfInstGenList *gens,
+                                 int gen_start, int gen_end, int preset_relative) {
+    for (int i = gen_start; i < gen_end; i++) {
+        struct sfInstGenList *gen = &gens[i];
+        int16_t val = gen->genAmount.shAmount;
         switch (gen->sfGenOper) {
+            case GEN_MOD_LFO_TO_PITCH:
+                state->mod_lfo_to_pitch = preset_relative ? (state->mod_lfo_to_pitch + val) : val;
+                break;
+            case GEN_VIB_LFO_TO_PITCH:
+                state->vib_lfo_to_pitch = preset_relative ? (state->vib_lfo_to_pitch + val) : val;
+                break;
+            case GEN_MOD_ENV_TO_PITCH:
+                state->mod_env_to_pitch = preset_relative ? (state->mod_env_to_pitch + val) : val;
+                break;
+            case GEN_INITIAL_FILTER_FC:
+                state->initial_filter_fc = preset_relative ? (state->initial_filter_fc + val) : val;
+                break;
+            case GEN_MOD_LFO_TO_FILTER_FC:
+                state->mod_lfo_to_filter_fc = preset_relative ? (state->mod_lfo_to_filter_fc + val) : val;
+                break;
+            case GEN_MOD_ENV_TO_FILTER_FC:
+                state->mod_env_to_filter_fc = preset_relative ? (state->mod_env_to_filter_fc + val) : val;
+                break;
+            case GEN_MOD_LFO_TO_VOLUME:
+                state->mod_lfo_to_volume = preset_relative ? (state->mod_lfo_to_volume + val) : val;
+                break;
+            case GEN_DELAY_MOD_LFO:
+                state->delay_mod_lfo = preset_relative ? (state->delay_mod_lfo + val) : val;
+                break;
+            case GEN_FREQ_MOD_LFO:
+                state->freq_mod_lfo = preset_relative ? (state->freq_mod_lfo + val) : val;
+                break;
+            case GEN_DELAY_VIB_LFO:
+                state->delay_vib_lfo = preset_relative ? (state->delay_vib_lfo + val) : val;
+                break;
+            case GEN_FREQ_VIB_LFO:
+                state->freq_vib_lfo = preset_relative ? (state->freq_vib_lfo + val) : val;
+                break;
+            case GEN_DELAY_MOD_ENV:
+                state->delay_mod_env = preset_relative ? (state->delay_mod_env + val) : val;
+                break;
+            case GEN_ATTACK_MOD_ENV:
+                state->attack_mod_env = preset_relative ? (state->attack_mod_env + val) : val;
+                break;
+            case GEN_HOLD_MOD_ENV:
+                state->hold_mod_env = preset_relative ? (state->hold_mod_env + val) : val;
+                break;
+            case GEN_DECAY_MOD_ENV:
+                state->decay_mod_env = preset_relative ? (state->decay_mod_env + val) : val;
+                break;
+            case GEN_SUSTAIN_MOD_ENV:
+                state->sustain_mod_env = preset_relative ? (state->sustain_mod_env + val) : val;
+                break;
+            case GEN_RELEASE_MOD_ENV:
+                state->release_mod_env = preset_relative ? (state->release_mod_env + val) : val;
+                break;
+            case GEN_DELAY_VOL_ENV:
+                state->delay_vol_env = preset_relative ? (state->delay_vol_env + val) : val;
+                break;
             case GEN_ATTACK_VOL_ENV:
-                patch->envelope1.fAttackTime = timecents_to_wf(gen->genAmount.shAmount);
+                state->attack_vol_env = preset_relative ? (state->attack_vol_env + val) : val;
+                break;
+            case GEN_HOLD_VOL_ENV:
+                state->hold_vol_env = preset_relative ? (state->hold_vol_env + val) : val;
                 break;
             case GEN_DECAY_VOL_ENV:
-                patch->envelope1.fDecay1Time = timecents_to_wf(gen->genAmount.shAmount);
+                state->decay_vol_env = preset_relative ? (state->decay_vol_env + val) : val;
                 break;
             case GEN_SUSTAIN_VOL_ENV:
-                patch->envelope1.cSustainLevel = centibels_to_level(gen->genAmount.shAmount);
+                state->sustain_vol_env = preset_relative ? (state->sustain_vol_env + val) : val;
                 break;
             case GEN_RELEASE_VOL_ENV:
-                patch->envelope1.fReleaseTime = timecents_to_wf(gen->genAmount.shAmount);
+                state->release_vol_env = preset_relative ? (state->release_vol_env + val) : val;
                 break;
             case GEN_INITIAL_ATTENUATION:
-                patch->fAmpBias = 127 - (gen->genAmount.shAmount / 8);
-                if (patch->fAmpBias > 127) patch->fAmpBias = 127;
-                if (patch->fAmpBias < 0) patch->fAmpBias = 0;
-                break;
-            case GEN_PAN:
-                /* Pan is handled at layer level in WFB */
+                state->initial_attenuation = preset_relative ? (state->initial_attenuation + val) : val;
                 break;
             case GEN_COARSE_TUNE:
-                patch->nFreqBias = swap16(gen->genAmount.shAmount * 100);
+                state->coarse_tune = preset_relative ? (state->coarse_tune + val) : val;
                 break;
             case GEN_FINE_TUNE:
-                {
-                    int16_t current = swap16(patch->nFreqBias);
-                    patch->nFreqBias = swap16(current + gen->genAmount.shAmount);
-                }
+                state->fine_tune = preset_relative ? (state->fine_tune + val) : val;
+                break;
+            case GEN_PAN:
+                state->pan = preset_relative ? (state->pan + val) : val;
+                break;
+            case GEN_EXCLUSIVE_CLASS:
+                state->exclusive_class = preset_relative ? (state->exclusive_class + val) : val;
+                break;
+            default:
                 break;
         }
     }
+}
+
+static void sf2_apply_preset_generators(struct Sf2GenState *state, struct sfGenList *gens,
+                                        int gen_start, int gen_end, int preset_relative) {
+    for (int i = gen_start; i < gen_end; i++) {
+        struct sfGenList *gen = &gens[i];
+        int16_t val = gen->genAmount.shAmount;
+        switch (gen->sfGenOper) {
+            case GEN_MOD_LFO_TO_PITCH:
+                state->mod_lfo_to_pitch = preset_relative ? (state->mod_lfo_to_pitch + val) : val;
+                break;
+            case GEN_VIB_LFO_TO_PITCH:
+                state->vib_lfo_to_pitch = preset_relative ? (state->vib_lfo_to_pitch + val) : val;
+                break;
+            case GEN_MOD_ENV_TO_PITCH:
+                state->mod_env_to_pitch = preset_relative ? (state->mod_env_to_pitch + val) : val;
+                break;
+            case GEN_INITIAL_FILTER_FC:
+                state->initial_filter_fc = preset_relative ? (state->initial_filter_fc + val) : val;
+                break;
+            case GEN_MOD_LFO_TO_FILTER_FC:
+                state->mod_lfo_to_filter_fc = preset_relative ? (state->mod_lfo_to_filter_fc + val) : val;
+                break;
+            case GEN_MOD_ENV_TO_FILTER_FC:
+                state->mod_env_to_filter_fc = preset_relative ? (state->mod_env_to_filter_fc + val) : val;
+                break;
+            case GEN_MOD_LFO_TO_VOLUME:
+                state->mod_lfo_to_volume = preset_relative ? (state->mod_lfo_to_volume + val) : val;
+                break;
+            case GEN_DELAY_MOD_LFO:
+                state->delay_mod_lfo = preset_relative ? (state->delay_mod_lfo + val) : val;
+                break;
+            case GEN_FREQ_MOD_LFO:
+                state->freq_mod_lfo = preset_relative ? (state->freq_mod_lfo + val) : val;
+                break;
+            case GEN_DELAY_VIB_LFO:
+                state->delay_vib_lfo = preset_relative ? (state->delay_vib_lfo + val) : val;
+                break;
+            case GEN_FREQ_VIB_LFO:
+                state->freq_vib_lfo = preset_relative ? (state->freq_vib_lfo + val) : val;
+                break;
+            case GEN_DELAY_MOD_ENV:
+                state->delay_mod_env = preset_relative ? (state->delay_mod_env + val) : val;
+                break;
+            case GEN_ATTACK_MOD_ENV:
+                state->attack_mod_env = preset_relative ? (state->attack_mod_env + val) : val;
+                break;
+            case GEN_HOLD_MOD_ENV:
+                state->hold_mod_env = preset_relative ? (state->hold_mod_env + val) : val;
+                break;
+            case GEN_DECAY_MOD_ENV:
+                state->decay_mod_env = preset_relative ? (state->decay_mod_env + val) : val;
+                break;
+            case GEN_SUSTAIN_MOD_ENV:
+                state->sustain_mod_env = preset_relative ? (state->sustain_mod_env + val) : val;
+                break;
+            case GEN_RELEASE_MOD_ENV:
+                state->release_mod_env = preset_relative ? (state->release_mod_env + val) : val;
+                break;
+            case GEN_DELAY_VOL_ENV:
+                state->delay_vol_env = preset_relative ? (state->delay_vol_env + val) : val;
+                break;
+            case GEN_ATTACK_VOL_ENV:
+                state->attack_vol_env = preset_relative ? (state->attack_vol_env + val) : val;
+                break;
+            case GEN_HOLD_VOL_ENV:
+                state->hold_vol_env = preset_relative ? (state->hold_vol_env + val) : val;
+                break;
+            case GEN_DECAY_VOL_ENV:
+                state->decay_vol_env = preset_relative ? (state->decay_vol_env + val) : val;
+                break;
+            case GEN_SUSTAIN_VOL_ENV:
+                state->sustain_vol_env = preset_relative ? (state->sustain_vol_env + val) : val;
+                break;
+            case GEN_RELEASE_VOL_ENV:
+                state->release_vol_env = preset_relative ? (state->release_vol_env + val) : val;
+                break;
+            case GEN_INITIAL_ATTENUATION:
+                state->initial_attenuation = preset_relative ? (state->initial_attenuation + val) : val;
+                break;
+            case GEN_COARSE_TUNE:
+                state->coarse_tune = preset_relative ? (state->coarse_tune + val) : val;
+                break;
+            case GEN_FINE_TUNE:
+                state->fine_tune = preset_relative ? (state->fine_tune + val) : val;
+                break;
+            case GEN_PAN:
+                state->pan = preset_relative ? (state->pan + val) : val;
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+static void apply_sf2_state_to_patch(struct PATCH *patch, const struct Sf2GenState *state) {
+    float delay_vol_s = sf2_timecents_to_seconds(state->delay_vol_env);
+    float attack_vol_s = sf2_timecents_to_seconds(state->attack_vol_env);
+    float hold_vol_s = sf2_timecents_to_seconds(state->hold_vol_env);
+    float decay_vol_s = sf2_timecents_to_seconds(state->decay_vol_env);
+    float release_vol_s = sf2_timecents_to_seconds(state->release_vol_env);
+
+    float delay_mod_s = sf2_timecents_to_seconds(state->delay_mod_env);
+    float attack_mod_s = sf2_timecents_to_seconds(state->attack_mod_env);
+    float hold_mod_s = sf2_timecents_to_seconds(state->hold_mod_env);
+    float decay_mod_s = sf2_timecents_to_seconds(state->decay_mod_env);
+    float release_mod_s = sf2_timecents_to_seconds(state->release_mod_env);
+
+    patch->envelope2.fAttackTime = wf_time_from_seconds(delay_vol_s + attack_vol_s);
+    patch->envelope2.fDecay1Time = wf_time_from_seconds(hold_vol_s);
+    patch->envelope2.fDecay2Time = wf_time_from_seconds(decay_vol_s);
+    patch->envelope2.fSustainTime = 0;
+    patch->envelope2.fReleaseTime = wf_time_from_seconds(release_vol_s);
+    patch->envelope2.fRelease2Time = 0;
+    patch->envelope2.cAttackLevel = 127;
+    patch->envelope2.cDecay1Level = 127;
+    patch->envelope2.cDecay2Level = centibels_to_level(state->sustain_vol_env);
+    patch->envelope2.cSustainLevel = centibels_to_level(state->sustain_vol_env);
+    patch->envelope2.cReleaseLevel = 0;
+
+    patch->envelope1.fAttackTime = wf_time_from_seconds(delay_mod_s + attack_mod_s);
+    patch->envelope1.fDecay1Time = wf_time_from_seconds(hold_mod_s);
+    patch->envelope1.fDecay2Time = wf_time_from_seconds(decay_mod_s);
+    patch->envelope1.fSustainTime = 0;
+    patch->envelope1.fReleaseTime = wf_time_from_seconds(release_mod_s);
+    patch->envelope1.fRelease2Time = 0;
+    patch->envelope1.cAttackLevel = 127;
+    patch->envelope1.cDecay1Level = 127;
+    patch->envelope1.cDecay2Level = mod_env_sustain_to_level(state->sustain_mod_env);
+    patch->envelope1.cSustainLevel = mod_env_sustain_to_level(state->sustain_mod_env);
+    patch->envelope1.cReleaseLevel = 0;
+
+    int amp_bias = 127 - (state->initial_attenuation / 5);
+    if (amp_bias > 127) amp_bias = 127;
+    if (amp_bias < 0) amp_bias = 0;
+    patch->fAmpBias = (uint8_t)amp_bias;
+
+    int16_t total_cents = (state->coarse_tune * 100) + state->fine_tune;
+    patch->nFreqBias = swap16((int16_t)total_cents);
+
+    patch->lfo1.fFrequency = wf_lfo_freq_from_hz(sf2_cents_to_hz(state->freq_vib_lfo));
+    patch->lfo1.fDelayTime = wf_time_from_seconds(sf2_timecents_to_seconds(state->delay_vib_lfo));
+    patch->lfo1.cStartLevel = 0;
+    patch->lfo1.cEndLevel = 127;
+    patch->lfo1.fRampTime = 0;
+
+    patch->lfo2.fFrequency = wf_lfo_freq_from_hz(sf2_cents_to_hz(state->freq_mod_lfo));
+    patch->lfo2.fDelayTime = wf_time_from_seconds(sf2_timecents_to_seconds(state->delay_mod_lfo));
+    patch->lfo2.cStartLevel = 0;
+    patch->lfo2.cEndLevel = 127;
+    patch->lfo2.fRampTime = 0;
+
+    patch->fFMSource1 = 0;
+    patch->cFMAmount1 = 0;
+    patch->fFMSource2 = 0;
+    patch->cFMAmount2 = 0;
+    patch->fAMSource = 0;
+    patch->cAMAmount = 0;
+    patch->fFC1MSource = 0;
+    patch->cFC1MAmount = 0;
+
+    if (state->vib_lfo_to_pitch != 0) {
+        patch->fFMSource1 = 0;
+        patch->cFMAmount1 = cents_to_amount(state->vib_lfo_to_pitch, 10);
+    }
+
+    if (state->mod_lfo_to_pitch != 0) {
+        patch->fFMSource2 = 1;
+        patch->cFMAmount2 = cents_to_amount(state->mod_lfo_to_pitch, 10);
+    }
+
+    if (state->mod_env_to_pitch != 0 && state->vib_lfo_to_pitch == 0) {
+        patch->fFMSource1 = 2;
+        patch->cFMAmount1 = cents_to_amount(state->mod_env_to_pitch, 10);
+    } else if (state->mod_env_to_pitch != 0 && state->mod_lfo_to_pitch == 0) {
+        patch->fFMSource2 = 2;
+        patch->cFMAmount2 = cents_to_amount(state->mod_env_to_pitch, 10);
+    }
+
+    if (state->mod_lfo_to_volume != 0) {
+        patch->fAMSource = 1;
+        patch->cAMAmount = centibels_to_amount(state->mod_lfo_to_volume, 5);
+    }
+
+    if (state->mod_env_to_filter_fc != 0) {
+        patch->fFC1MSource = 2;
+        patch->cFC1MAmount = cents_to_amount(state->mod_env_to_filter_fc, 100);
+    } else if (state->mod_lfo_to_filter_fc != 0) {
+        patch->fFC1MSource = 1;
+        patch->cFC1MAmount = cents_to_amount(state->mod_lfo_to_filter_fc, 100);
+    }
+
+    {
+        int bias = (state->initial_filter_fc - 13500) / 100;
+        if (bias < -127) bias = -127;
+        if (bias > 127) bias = 127;
+        patch->cFC1FreqBias = (int8_t)bias;
+    }
+}
+
+static uint8_t sf2_pan_to_wf(int16_t pan) {
+    if (pan < -500) pan = -500;
+    if (pan > 500) pan = 500;
+    int value = ((pan + 500) * 7 + 500) / 1000;
+    if (value < 0) value = 0;
+    if (value > 7) value = 7;
+    return (uint8_t)value;
+}
+
+static uint8_t sf2_atten_to_mixlevel(int16_t centibels) {
+    int level = 127 - (centibels / 5);
+    if (level < 0) level = 0;
+    if (level > 127) level = 127;
+    return (uint8_t)level;
+}
+
+static int zone_matches_key_inst(struct sfInstGenList *gens, int gen_start, int gen_end, int key) {
+    for (int i = gen_start; i < gen_end; i++) {
+        if (gens[i].sfGenOper == GEN_KEY_RANGE) {
+            uint8_t lo = gens[i].genAmount.range.byLo;
+            uint8_t hi = gens[i].genAmount.range.byHi;
+            return key >= lo && key <= hi;
+        }
+    }
+    return 1;
+}
+
+static int zone_matches_key_preset(struct sfGenList *gens, int gen_start, int gen_end, int key) {
+    for (int i = gen_start; i < gen_end; i++) {
+        if (gens[i].sfGenOper == GEN_KEY_RANGE) {
+            uint8_t lo = gens[i].genAmount.range.byLo;
+            uint8_t hi = gens[i].genAmount.range.byHi;
+            return key >= lo && key <= hi;
+        }
+    }
+    return 1;
+}
+
+static int find_sample_in_inst_zone(struct SF2Bank *sf2, int gen_start, int gen_end) {
+    for (int i = gen_start; i < gen_end; i++) {
+        if (sf2->inst_gens[i].sfGenOper == GEN_SAMPLE_ID) {
+            return sf2->inst_gens[i].genAmount.wAmount;
+        }
+    }
+    return -1;
+}
+
+static int find_instrument_in_preset_zone(struct SF2Bank *sf2, int gen_start, int gen_end) {
+    for (int i = gen_start; i < gen_end; i++) {
+        if (sf2->preset_gens[i].sfGenOper == GEN_INSTRUMENT) {
+            return sf2->preset_gens[i].genAmount.wAmount;
+        }
+    }
+    return -1;
+}
+
+static int sf2_find_stereo_pair(struct SF2Bank *sf2, int sample_idx, int *left_idx, int *right_idx) {
+    if (sample_idx < 0 || sample_idx >= sf2->sample_count) {
+        return 0;
+    }
+    struct sfSample *samp = &sf2->samples[sample_idx];
+    if (samp->sfSampleType != LEFT_SAMPLE && samp->sfSampleType != RIGHT_SAMPLE) {
+        return 0;
+    }
+    int link_idx = samp->wSampleLink;
+    if (link_idx < 0 || link_idx >= sf2->sample_count) {
+        return 0;
+    }
+    struct sfSample *link = &sf2->samples[link_idx];
+    if (samp->sfSampleType == LEFT_SAMPLE && link->sfSampleType != RIGHT_SAMPLE) {
+        return 0;
+    }
+    if (samp->sfSampleType == RIGHT_SAMPLE && link->sfSampleType != LEFT_SAMPLE) {
+        return 0;
+    }
+    uint32_t len_a = samp->dwEnd - samp->dwStart;
+    uint32_t len_b = link->dwEnd - link->dwStart;
+    if (len_a != len_b || samp->dwSampleRate != link->dwSampleRate) {
+        return 0;
+    }
+    if (samp->sfSampleType == LEFT_SAMPLE) {
+        *left_idx = sample_idx;
+        *right_idx = link_idx;
+    } else {
+        *left_idx = link_idx;
+        *right_idx = sample_idx;
+    }
+    return 1;
 }
 
 /* Add a sample to the WFB bank */
@@ -128,7 +631,8 @@ static int add_sample(struct WFBBank *wfb, struct SF2Bank *sf2, int sf2_sample_i
                       int *resampled_count) {
     struct sfSample *sf2_samp;
     struct WaveFrontExtendedSampleInfo *info;
-    struct SAMPLE *wf_samp;
+    struct SAMPLE temp_sample;
+    struct ALIAS temp_alias;
     int16_t *sample_data;
     uint32_t sample_count, sample_rate;
     int wfb_idx;
@@ -142,15 +646,6 @@ static int add_sample(struct WFBBank *wfb, struct SF2Bank *sf2, int sf2_sample_i
     }
 
     sf2_samp = &sf2->samples[sf2_sample_idx];
-    wfb_idx = wfb->sample_count;
-
-    info = &wfb->samples[wfb_idx].info;
-    wf_samp = &wfb->samples[wfb_idx].data.sample;
-
-    /* Fill in sample info */
-    info->nSampleType = WF_ST_SAMPLE;
-    info->nNumber = wfb_idx;
-    safe_string_copy(info->szName, sf2_samp->achSampleName, NAME_LENGTH);
 
     sample_rate = sf2_samp->dwSampleRate;
     sample_count = sf2_samp->dwEnd - sf2_samp->dwStart;
@@ -168,23 +663,9 @@ static int add_sample(struct WFBBank *wfb, struct SF2Bank *sf2, int sf2_sample_i
         (*resampled_count)++;
     }
 
-    info->dwSampleRate = sample_rate;
-    info->dwSizeInSamples = sample_count;
-    info->dwSizeInBytes = sample_count * sizeof(int16_t);
-
-    /* Detect stereo pairing */
-    if (sf2_samp->sfSampleType == LEFT_SAMPLE) {
-        info->nChannel = WF_CH_LEFT;
-    } else if (sf2_samp->sfSampleType == RIGHT_SAMPLE) {
-        info->nChannel = WF_CH_RIGHT;
-    } else {
-        info->nChannel = WF_CH_MONO;
-    }
-
-    /* Fill SAMPLE struct */
-    memset(wf_samp, 0, sizeof(*wf_samp));
-    wf_samp->sampleStartOffset.fInteger = 0;
-    wf_samp->sampleEndOffset.fInteger = sample_count;
+    memset(&temp_sample, 0, sizeof(temp_sample));
+    resample_set_sample_offset(&temp_sample.sampleStartOffset, 0.0, sample_count);
+    resample_set_sample_offset(&temp_sample.sampleEndOffset, (double)sample_count, sample_count);
 
     /* Set loop points if present */
     if (sf2_samp->dwStartloop < sf2_samp->dwEndloop &&
@@ -194,23 +675,106 @@ static int add_sample(struct WFBBank *wfb, struct SF2Bank *sf2, int sf2_sample_i
         uint32_t loop_start = sf2_samp->dwStartloop - sf2_samp->dwStart;
         uint32_t loop_end = sf2_samp->dwEndloop - sf2_samp->dwStart;
 
-        /* Adjust for resampling */
-        if (sf2_samp->dwSampleRate != sample_rate) {
-            float ratio = (float)sample_rate / (float)sf2_samp->dwSampleRate;
-            loop_start = (uint32_t)(loop_start * ratio);
-            loop_end = (uint32_t)(loop_end * ratio);
-        }
-
-        wf_samp->loopStartOffset.fInteger = loop_start;
-        wf_samp->loopEndOffset.fInteger = loop_end;
-        wf_samp->fLoop = 1;
+        resample_scale_loop_points(sf2_samp->dwSampleRate, sample_rate,
+                                   loop_start, loop_end, sample_count,
+                                   &temp_sample.loopStartOffset,
+                                   &temp_sample.loopEndOffset);
+        temp_sample.fLoop = 1;
     }
 
-    wf_samp->nFrequencyBias = cents_to_freq_bias(sf2_samp->chPitchCorrection);
-    wf_samp->fSampleResolution = LINEAR_16BIT;
+    temp_sample.nFrequencyBias = cents_to_freq_bias(sf2_samp->chPitchCorrection);
+    temp_sample.fSampleResolution = LINEAR_16BIT;
+
+    uint32_t channel = WF_CH_MONO;
+    if (sf2_samp->sfSampleType == LEFT_SAMPLE) {
+        channel = WF_CH_LEFT;
+    } else if (sf2_samp->sfSampleType == RIGHT_SAMPLE) {
+        channel = WF_CH_RIGHT;
+    }
+
+    uint64_t data_hash = hash_pcm_data(sample_data, sample_count);
+
+    for (int i = 0; i < wfb->sample_count; i++) {
+        struct WaveFrontExtendedSampleInfo *existing_info = &wfb->samples[i].info;
+        struct SAMPLE *existing_sample = &wfb->samples[i].data.sample;
+
+        if (existing_info->nSampleType != WF_ST_SAMPLE) {
+            continue;
+        }
+        if (existing_info->dwSampleRate != sample_rate ||
+            existing_info->dwSizeInSamples != sample_count ||
+            existing_info->nChannel != channel) {
+            continue;
+        }
+        if (wfb->samples[i].data_hash != data_hash) {
+            continue;
+        }
+        if (!sample_offsets_equal(&existing_sample->loopStartOffset, &temp_sample.loopStartOffset) ||
+            !sample_offsets_equal(&existing_sample->loopEndOffset, &temp_sample.loopEndOffset) ||
+            !sample_offsets_equal(&existing_sample->sampleStartOffset, &temp_sample.sampleStartOffset) ||
+            !sample_offsets_equal(&existing_sample->sampleEndOffset, &temp_sample.sampleEndOffset) ||
+            existing_sample->fLoop != temp_sample.fLoop ||
+            existing_sample->nFrequencyBias != temp_sample.nFrequencyBias ||
+            existing_sample->fSampleResolution != temp_sample.fSampleResolution) {
+            continue;
+        }
+        if (memcmp(wfb->samples[i].pcm_data, sample_data,
+                   sample_count * sizeof(int16_t)) != 0) {
+            continue;
+        }
+
+        if (wfb->sample_count >= WF_MAX_SAMPLES) {
+            free(sample_data);
+            return -1;
+        }
+
+        wfb_idx = wfb->sample_count;
+        info = &wfb->samples[wfb_idx].info;
+        info->nSampleType = WF_ST_ALIAS;
+        info->nNumber = wfb_idx;
+        safe_string_copy(info->szName, sf2_samp->achSampleName, NAME_LENGTH);
+        info->dwSampleRate = 0;
+        info->dwSizeInSamples = 0;
+        info->dwSizeInBytes = 0;
+        info->nChannel = 0;
+
+        memset(&temp_alias, 0, sizeof(temp_alias));
+        temp_alias.nOriginalSample = i;
+        temp_alias.sampleStartOffset = existing_sample->sampleStartOffset;
+        temp_alias.loopStartOffset = existing_sample->loopStartOffset;
+        temp_alias.loopEndOffset = existing_sample->loopEndOffset;
+        temp_alias.sampleEndOffset = existing_sample->sampleEndOffset;
+        temp_alias.nFrequencyBias = existing_sample->nFrequencyBias;
+        temp_alias.fSampleResolution = existing_sample->fSampleResolution;
+        temp_alias.fLoop = existing_sample->fLoop;
+        temp_alias.fBidirectional = existing_sample->fBidirectional;
+        temp_alias.fReverse = existing_sample->fReverse;
+
+        wfb->samples[wfb_idx].data.alias = temp_alias;
+        wfb->samples[wfb_idx].pcm_data = NULL;
+        wfb->samples[wfb_idx].data_hash = 0;
+
+        wfb->sample_count++;
+        g_dedupe_alias_count++;
+        free(sample_data);
+        return wfb_idx;
+    }
+
+    wfb_idx = wfb->sample_count;
+    info = &wfb->samples[wfb_idx].info;
+    info->nSampleType = WF_ST_SAMPLE;
+    info->nNumber = wfb_idx;
+    safe_string_copy(info->szName, sf2_samp->achSampleName, NAME_LENGTH);
+    info->dwSampleRate = sample_rate;
+    info->dwSizeInSamples = sample_count;
+    info->dwSizeInBytes = sample_count * sizeof(int16_t);
+    info->nChannel = channel;
+
+    wfb->samples[wfb_idx].data.sample = temp_sample;
 
     /* Store PCM data */
     wfb->samples[wfb_idx].pcm_data = sample_data;
+    wfb->samples[wfb_idx].data_hash = data_hash;
 
     /* Update totals */
     wfb->total_sample_memory += info->dwSizeInBytes;
@@ -228,6 +792,8 @@ static int convert_preset(struct WFBBank *wfb, struct SF2Bank *sf2,
     int bag_start, bag_end;
     int layer_idx = 0;
     int i;
+    int preset_global_gen_start = -1;
+    int preset_global_gen_end = -1;
 
     if (wfb->program_count >= WF_MAX_PROGRAMS) {
         return -1;
@@ -261,6 +827,10 @@ static int convert_preset(struct WFBBank *wfb, struct SF2Bank *sf2,
         }
 
         if (instrument_idx < 0 || instrument_idx >= sf2->inst_count) {
+            if (instrument_idx < 0 && preset_global_gen_start < 0) {
+                preset_global_gen_start = gen_start;
+                preset_global_gen_end = gen_end;
+            }
             continue;  /* Skip global zone or invalid */
         }
 
@@ -293,40 +863,292 @@ static int convert_preset(struct WFBBank *wfb, struct SF2Bank *sf2,
                               sf2->inst_bags[inst_bag_start + 1].wInstGenNdx :
                               sf2->inst_gen_count;
             int sample_idx = -1;
-
-            /* Apply generators */
-            apply_generators(&wf_patch->base, sf2, inst_gen_start, inst_gen_end);
+            int has_sample = 0;
+            int inst_global_gen_start = -1;
+            int inst_global_gen_end = -1;
 
             /* Find sample */
             for (j = inst_gen_start; j < inst_gen_end; j++) {
                 if (sf2->inst_gens[j].sfGenOper == GEN_SAMPLE_ID) {
                     sample_idx = sf2->inst_gens[j].genAmount.wAmount;
+                    has_sample = 1;
                     break;
                 }
             }
 
-            /* Add sample */
+            if (!has_sample && inst_bag_start + 1 < inst_bag_end) {
+                inst_global_gen_start = inst_gen_start;
+                inst_global_gen_end = inst_gen_end;
+                inst_bag = &sf2->inst_bags[inst_bag_start + 1];
+                inst_gen_start = inst_bag->wInstGenNdx;
+                inst_gen_end = (inst_bag_start + 2 < sf2->inst_bag_count) ?
+                              sf2->inst_bags[inst_bag_start + 2].wInstGenNdx :
+                              sf2->inst_gen_count;
+                for (j = inst_gen_start; j < inst_gen_end; j++) {
+                    if (sf2->inst_gens[j].sfGenOper == GEN_SAMPLE_ID) {
+                        sample_idx = sf2->inst_gens[j].genAmount.wAmount;
+                        break;
+                    }
+                }
+            }
+
+            {
+                struct Sf2GenState gen_state;
+                sf2_gen_defaults(&gen_state);
+                if (inst_global_gen_start >= 0) {
+                    sf2_apply_generators(&gen_state, sf2->inst_gens,
+                                         inst_global_gen_start, inst_global_gen_end, 0);
+                }
+                sf2_apply_generators(&gen_state, sf2->inst_gens,
+                                     inst_gen_start, inst_gen_end, 0);
+                if (preset_global_gen_start >= 0) {
+                    sf2_apply_preset_generators(&gen_state, sf2->preset_gens,
+                                                preset_global_gen_start, preset_global_gen_end, 1);
+                }
+                sf2_apply_preset_generators(&gen_state, sf2->preset_gens,
+                                            gen_start, gen_end, 1);
+                apply_sf2_state_to_patch(&wf_patch->base, &gen_state);
+            }
+
+            /* Add sample (with stereo pairing if linked) */
             if (sample_idx >= 0) {
-                int wfb_sample_idx = add_sample(wfb, sf2, sample_idx, resampled_count);
-                if (wfb_sample_idx >= 0) {
-                    wf_patch->base.bySampleNumber = wfb_sample_idx;
+                int left_idx = -1;
+                int right_idx = -1;
+                int is_stereo = sf2_find_stereo_pair(sf2, sample_idx, &left_idx, &right_idx);
+                if (is_stereo && layer_idx + 1 < NUM_LAYERS &&
+                    wfb->patch_count + 1 < WF_MAX_PATCHES) {
+                    int left_wfb = add_sample(wfb, sf2, left_idx, resampled_count);
+                    int right_wfb = add_sample(wfb, sf2, right_idx, resampled_count);
+                    if (left_wfb >= 0 && right_wfb >= 0) {
+                        wf_patch->base.bySampleNumber = left_wfb;
+
+                        struct LAYER *layer_l = &wf_prog->base.layer[layer_idx];
+                        layer_l->byPatchNumber = wfb->patch_count;
+                        layer_l->fMixLevel = 127;
+                        layer_l->fUnmute = 1;
+                        layer_l->fSplitPoint = 0;
+                        layer_l->fPan = 0;
+
+                        wfb->patch_count++;
+                        layer_idx++;
+
+                        struct WaveFrontPatch *wf_patch_r = &wfb->patches[wfb->patch_count];
+                        memset(wf_patch_r, 0, sizeof(*wf_patch_r));
+                        wf_patch_r->nNumber = wfb->patch_count;
+                        snprintf(wf_patch_r->szName, NAME_LENGTH, "%s_L%dR",
+                                 preset->achPresetName, layer_idx);
+                        wf_patch_r->base = wf_patch->base;
+                        wf_patch_r->base.bySampleNumber = right_wfb;
+
+                        struct LAYER *layer_r = &wf_prog->base.layer[layer_idx];
+                        layer_r->byPatchNumber = wfb->patch_count;
+                        layer_r->fMixLevel = 127;
+                        layer_r->fUnmute = 1;
+                        layer_r->fSplitPoint = 0;
+                        layer_r->fPan = 7;
+
+                        wfb->patch_count++;
+                        layer_idx++;
+                        continue;
+                    }
+                }
+
+                {
+                    int wfb_sample_idx = add_sample(wfb, sf2, sample_idx, resampled_count);
+                    if (wfb_sample_idx >= 0) {
+                        wf_patch->base.bySampleNumber = wfb_sample_idx;
+                    }
                 }
             }
         }
 
-        /* Setup layer */
-        struct LAYER *layer = &wf_prog->base.layer[layer_idx];
-        layer->byPatchNumber = wfb->patch_count;
-        layer->fMixLevel = 127;
-        layer->fUnmute = 1;
-        layer->fSplitPoint = 0;
-        layer->fPan = 7;  /* Center */
-
-        wfb->patch_count++;
-        layer_idx++;
+        /* Setup layer (mono) */
+        {
+            struct LAYER *layer = &wf_prog->base.layer[layer_idx];
+            layer->byPatchNumber = wfb->patch_count;
+            layer->fMixLevel = 127;
+            layer->fUnmute = 1;
+            layer->fSplitPoint = 0;
+            layer->fPan = 7;  /* Center */
+            wfb->patch_count++;
+            layer_idx++;
+        }
     }
 
     wfb->program_count++;
+    return 0;
+}
+
+static int convert_drumkit(struct WFBBank *wfb, struct SF2Bank *sf2,
+                           struct sfPresetHeader *preset, int *resampled_count) {
+    int bag_start, bag_end;
+    int preset_global_gen_start = -1;
+    int preset_global_gen_end = -1;
+
+    if (wfb->has_drumkit) {
+        return 0;
+    }
+
+    memset(&wfb->drumkit, 0, sizeof(wfb->drumkit));
+    for (int i = 0; i < NUM_MIDIKEYS; i++) {
+        wfb->drumkit.base.drum[i].byPatchNumber = 0;
+        wfb->drumkit.base.drum[i].fMixLevel = 0;
+        wfb->drumkit.base.drum[i].fUnmute = 0;
+        wfb->drumkit.base.drum[i].fGroup = 0;
+        wfb->drumkit.base.drum[i].fPanModSource = 0;
+        wfb->drumkit.base.drum[i].fPanModulated = 0;
+        wfb->drumkit.base.drum[i].fPanAmount = 4;
+    }
+
+    bag_start = preset->wPresetBagNdx;
+    bag_end = (preset < &sf2->presets[sf2->preset_count - 1]) ?
+              (preset + 1)->wPresetBagNdx : sf2->preset_bag_count;
+
+    for (int i = bag_start; i < bag_end; i++) {
+        struct sfPresetBag *bag = &sf2->preset_bags[i];
+        int gen_start = bag->wGenNdx;
+        int gen_end = (i + 1 < sf2->preset_bag_count) ?
+                      sf2->preset_bags[i + 1].wGenNdx : sf2->preset_gen_count;
+        int instrument_idx = find_instrument_in_preset_zone(sf2, gen_start, gen_end);
+
+        if (instrument_idx < 0 || instrument_idx >= sf2->inst_count) {
+            if (instrument_idx < 0 && preset_global_gen_start < 0) {
+                preset_global_gen_start = gen_start;
+                preset_global_gen_end = gen_end;
+            }
+            continue;
+        }
+    }
+
+    for (int key = 35; key <= 81; key++) {
+        int matched = 0;
+        for (int i = bag_start; i < bag_end; i++) {
+            struct sfPresetBag *bag = &sf2->preset_bags[i];
+            int gen_start = bag->wGenNdx;
+            int gen_end = (i + 1 < sf2->preset_bag_count) ?
+                          sf2->preset_bags[i + 1].wGenNdx : sf2->preset_gen_count;
+            int instrument_idx = find_instrument_in_preset_zone(sf2, gen_start, gen_end);
+
+            if (instrument_idx < 0 || instrument_idx >= sf2->inst_count) {
+                continue;
+            }
+
+            if (!zone_matches_key_preset(sf2->preset_gens, gen_start, gen_end, key)) {
+                continue;
+            }
+
+            struct sfInst *inst = &sf2->instruments[instrument_idx];
+            int inst_bag_start = inst->wInstBagNdx;
+            int inst_bag_end = (instrument_idx + 1 < sf2->inst_count) ?
+                              sf2->instruments[instrument_idx + 1].wInstBagNdx :
+                              sf2->inst_bag_count;
+            int inst_global_gen_start = -1;
+            int inst_global_gen_end = -1;
+            int inst_zone_gen_start = -1;
+            int inst_zone_gen_end = -1;
+            int sample_idx = -1;
+
+            for (int ib = inst_bag_start; ib < inst_bag_end; ib++) {
+                struct sfInstBag *inst_bag = &sf2->inst_bags[ib];
+                int inst_gen_start = inst_bag->wInstGenNdx;
+                int inst_gen_end = (ib + 1 < sf2->inst_bag_count) ?
+                                  sf2->inst_bags[ib + 1].wInstGenNdx :
+                                  sf2->inst_gen_count;
+                int zone_sample = find_sample_in_inst_zone(sf2, inst_gen_start, inst_gen_end);
+
+                if (zone_sample < 0 && inst_global_gen_start < 0) {
+                    inst_global_gen_start = inst_gen_start;
+                    inst_global_gen_end = inst_gen_end;
+                    continue;
+                }
+
+                if (!zone_matches_key_inst(sf2->inst_gens, inst_gen_start, inst_gen_end, key)) {
+                    continue;
+                }
+
+                if (zone_sample >= 0) {
+                    inst_zone_gen_start = inst_gen_start;
+                    inst_zone_gen_end = inst_gen_end;
+                    sample_idx = zone_sample;
+                    break;
+                }
+            }
+
+            if (sample_idx < 0) {
+                continue;
+            }
+
+            {
+                int left_idx = -1;
+                int right_idx = -1;
+                if (sf2_find_stereo_pair(sf2, sample_idx, &left_idx, &right_idx)) {
+                    sample_idx = left_idx;
+                }
+            }
+
+            if (wfb->patch_count >= WF_MAX_PATCHES) {
+                return -1;
+            }
+
+            struct WaveFrontPatch *wf_patch = &wfb->patches[wfb->patch_count];
+            memset(wf_patch, 0, sizeof(*wf_patch));
+            wf_patch->nNumber = wfb->patch_count;
+            snprintf(wf_patch->szName, NAME_LENGTH, "Drum_%d", key);
+            init_default_patch(&wf_patch->base);
+
+            struct Sf2GenState gen_state;
+            sf2_gen_defaults(&gen_state);
+            if (inst_global_gen_start >= 0) {
+                sf2_apply_generators(&gen_state, sf2->inst_gens,
+                                     inst_global_gen_start, inst_global_gen_end, 0);
+            }
+            if (inst_zone_gen_start >= 0) {
+                sf2_apply_generators(&gen_state, sf2->inst_gens,
+                                     inst_zone_gen_start, inst_zone_gen_end, 0);
+            }
+            if (preset_global_gen_start >= 0) {
+                sf2_apply_preset_generators(&gen_state, sf2->preset_gens,
+                                            preset_global_gen_start, preset_global_gen_end, 1);
+            }
+            sf2_apply_preset_generators(&gen_state, sf2->preset_gens,
+                                        gen_start, gen_end, 1);
+            apply_sf2_state_to_patch(&wf_patch->base, &gen_state);
+
+            if (gen_state.exclusive_class > 0) {
+                wf_patch->base.fReuse = 1;
+            }
+
+            int wfb_sample_idx = add_sample(wfb, sf2, sample_idx, resampled_count);
+            if (wfb_sample_idx >= 0) {
+                wf_patch->base.bySampleNumber = wfb_sample_idx;
+            }
+
+            struct DRUM *drum = &wfb->drumkit.base.drum[key];
+            drum->byPatchNumber = wfb->patch_count;
+            drum->fMixLevel = sf2_atten_to_mixlevel(gen_state.initial_attenuation);
+            drum->fUnmute = 1;
+            if (gen_state.exclusive_class > 0) {
+                int group = gen_state.exclusive_class;
+                if (group > 15) group = 15;
+                drum->fGroup = (uint8_t)group;
+            } else {
+                drum->fGroup = 0;
+            }
+            drum->fPanModSource = 0;
+            drum->fPanModulated = 0;
+            drum->fPanAmount = sf2_pan_to_wf(gen_state.pan);
+
+            wfb->patch_count++;
+            matched = 1;
+            break;
+        }
+
+        if (!matched) {
+            wfb->drumkit.base.drum[key].fUnmute = 0;
+        }
+    }
+
+    wfb->has_drumkit = 1;
     return 0;
 }
 
@@ -370,10 +1192,9 @@ int convert_sf2_to_wfb(const char *input_file, const char *output_file,
         }
 
         if (drums) {
-            /* For drums, we'd need to create a drumkit structure
-             * This is simplified for now */
-            wfb.has_drumkit = 1;
-            memset(&wfb.drumkit, 0, sizeof(wfb.drumkit));
+            if (convert_drumkit(&wfb, &sf2, drums, &resampled_count) != 0) {
+                fprintf(stderr, "Warning: Failed to convert drumkit\n");
+            }
         }
     }
 
@@ -409,6 +1230,9 @@ int convert_sf2_to_wfb(const char *input_file, const char *output_file,
     printf("Conversion complete: '%s' -> '%s'\n", input_file, final_output);
     printf("  Programs: %d, Patches: %d, Samples: %d\n",
            wfb.program_count, wfb.patch_count, wfb.sample_count);
+    if (g_dedupe_alias_count > 0) {
+        printf("  Deduped samples (aliases): %d\n", g_dedupe_alias_count);
+    }
     if (resampled_count > 0) {
         printf("  Resampled: %d samples\n", resampled_count);
     }

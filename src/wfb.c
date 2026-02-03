@@ -209,10 +209,31 @@ int wfb_read(const char *filename, struct WFBBank *bank) {
                 fprintf(stderr, "Error: Failed to read sample %d info\n", i);
                 break;
             }
+            uint32_t struct_bytes = 0;
+            if (bank->samples[i].info.nSampleType == WF_ST_SAMPLE) {
+                if (fread(&bank->samples[i].data.sample, sizeof(struct SAMPLE), 1, f) != 1) {
+                    fprintf(stderr, "Error: Failed to read sample %d data struct\n", i);
+                    break;
+                }
+                struct_bytes = sizeof(struct SAMPLE);
+            } else if (bank->samples[i].info.nSampleType == WF_ST_MULTISAMPLE) {
+                struct_bytes = sizeof(struct MULTISAMPLE);
+            } else if (bank->samples[i].info.nSampleType == WF_ST_ALIAS) {
+                struct_bytes = sizeof(struct ALIAS);
+            }
+            if (struct_bytes > 0) {
+                fseek(f, struct_bytes + MAX_PATH_LENGTH, SEEK_CUR);
+            } else if (bank->samples[i].info.nSampleType == WF_ST_MULTISAMPLE) {
+                /* No-op */
+            }
             /* Skip the rest of the sample data */
             uint32_t skip_size = bank->samples[i].info.dwSize -
                                  sizeof(struct WaveFrontExtendedSampleInfo);
-            fseek(f, skip_size, SEEK_CUR);
+            if (skip_size > struct_bytes + MAX_PATH_LENGTH) {
+                fseek(f, skip_size - (struct_bytes + MAX_PATH_LENGTH), SEEK_CUR);
+            } else if (skip_size > 0) {
+                fseek(f, skip_size, SEEK_CUR);
+            }
         }
     }
 

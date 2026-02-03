@@ -35,6 +35,7 @@ struct WFBBank {
             struct ALIAS alias;
         } data;
         int16_t *pcm_data;           /* Raw sample data */
+        uint64_t data_hash;          /* Hash of PCM data for dedup */
         char filespec[MAX_PATH_LENGTH];
     } samples[WF_MAX_SAMPLES];
 
@@ -96,6 +97,13 @@ void wfb_print_info(struct WFBBank *bank);
 int16_t *resample_linear(int16_t *input, uint32_t input_samples,
                          uint32_t input_rate, uint32_t output_rate,
                          uint32_t *output_samples);
+void resample_set_sample_offset(struct SAMPLE_OFFSET *offset, double pos,
+                                uint32_t max_samples);
+void resample_scale_loop_points(uint32_t input_rate, uint32_t output_rate,
+                                uint32_t input_loop_start, uint32_t input_loop_end,
+                                uint32_t output_samples,
+                                struct SAMPLE_OFFSET *out_start,
+                                struct SAMPLE_OFFSET *out_end);
 
 /* Utility */
 const char *get_auto_increment_filename(const char *base_path);

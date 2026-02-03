@@ -5,10 +5,61 @@
 #include "../include/converter.h"
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* Linear interpolation between two samples */
 static inline int16_t lerp(int16_t a, int16_t b, float t) {
     return (int16_t)(a + t * (b - a));
+}
+
+void resample_set_sample_offset(struct SAMPLE_OFFSET *offset, double pos,
+                                uint32_t max_samples) {
+    if (!offset) {
+        return;
+    }
+    if (pos < 0.0) {
+        pos = 0.0;
+    }
+    if (pos > (double)max_samples) {
+        pos = (double)max_samples;
+    }
+    double int_part = floor(pos);
+    double frac = pos - int_part;
+    int frac_steps = (int)lround(frac * 16.0);
+    if (frac_steps >= 16) {
+        int_part += 1.0;
+        frac_steps = 0;
+    }
+    if (int_part > (double)max_samples) {
+        int_part = (double)max_samples;
+        frac_steps = 0;
+    }
+    offset->fInteger = (uint32_t)int_part;
+    offset->fFraction = (uint32_t)frac_steps;
+    offset->fUnused = 0;
+}
+
+void resample_scale_loop_points(uint32_t input_rate, uint32_t output_rate,
+                                uint32_t input_loop_start, uint32_t input_loop_end,
+                                uint32_t output_samples,
+                                struct SAMPLE_OFFSET *out_start,
+                                struct SAMPLE_OFFSET *out_end) {
+    double ratio;
+    double start_pos;
+    double end_pos;
+
+    if (input_rate == 0 || output_rate == 0) {
+        resample_set_sample_offset(out_start, 0.0, output_samples);
+        resample_set_sample_offset(out_end, (double)output_samples, output_samples);
+        return;
+    }
+
+    ratio = (double)output_rate / (double)input_rate;
+    start_pos = (double)input_loop_start * ratio;
+    end_pos = (double)input_loop_end * ratio;
+
+    resample_set_sample_offset(out_start, start_pos, output_samples);
+    resample_set_sample_offset(out_end, end_pos, output_samples);
 }
 
 /*
