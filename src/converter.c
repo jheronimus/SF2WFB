@@ -31,11 +31,39 @@ static int sample_offsets_equal(const struct SAMPLE_OFFSET *a, const struct SAMP
     return a->fInteger == b->fInteger && a->fFraction == b->fFraction;
 }
 
-static int g_dedupe_alias_count = 0;
-static int g_patch_reserve = 0;
-static int *g_sf2_sample_map = NULL;
-static int g_sf2_sample_map_count = 0;
-static int g_verbose = 0;
+/* Conversion context to avoid global state */
+struct ConversionContext {
+    int dedupe_alias_count;
+    int patch_reserve;
+    int *sf2_sample_map;
+    int sf2_sample_map_count;
+    int verbose;
+};
+
+/* Initialize conversion context */
+static void init_conversion_context(struct ConversionContext *ctx, int sample_count, int verbose) {
+    ctx->dedupe_alias_count = 0;
+    ctx->patch_reserve = 0;
+    ctx->verbose = verbose;
+    ctx->sf2_sample_map_count = sample_count;
+    if (sample_count > 0) {
+        ctx->sf2_sample_map = malloc((size_t)sample_count * sizeof(int));
+        if (ctx->sf2_sample_map) {
+            for (int i = 0; i < sample_count; i++) {
+                ctx->sf2_sample_map[i] = -1;
+            }
+        }
+    } else {
+        ctx->sf2_sample_map = NULL;
+    }
+}
+
+/* Free conversion context resources */
+static void free_conversion_context(struct ConversionContext *ctx) {
+    free(ctx->sf2_sample_map);
+    ctx->sf2_sample_map = NULL;
+    ctx->sf2_sample_map_count = 0;
+}
 
 static int patch_base_equal(const struct PATCH *a, const struct PATCH *b) {
     return memcmp(a, b, sizeof(*a)) == 0;
@@ -226,11 +254,16 @@ static int8_t centibels_to_amount(int16_t centibels, int16_t scale) {
     return (int8_t)value;
 }
 
-static int8_t mod_env_sustain_to_level(int16_t sustain_permille) {
-    if (sustain_permille < 0) sustain_permille = 0;
-    if (sustain_permille > 1000) sustain_permille = 1000;
-    int level = 127 - (sustain_permille * 127) / 1000;
-    if (level < -127) level = -127;
+/* Convert SF2 mod envelope sustain (centibels attenuation) to WaveFront level
+ * SF2: 0 = no attenuation (full), 1000 = -100dB (silent)
+ * WaveFront: 127 = full, 0 = silent
+ * Note: SF2 spec section 8.1.3 defines sustainModEnv as centibels (0.1 dB) */
+static int8_t mod_env_sustain_to_level(int16_t sustain_centibels) {
+    if (sustain_centibels < 0) sustain_centibels = 0;
+    if (sustain_centibels > 1000) sustain_centibels = 1000;
+    /* Divide by 8 to convert centibels to ~WaveFront scale (same as vol env) */
+    int level = 127 - (sustain_centibels / 8);
+    if (level < 0) level = 0;
     if (level > 127) level = 127;
     return (int8_t)level;
 }
@@ -275,6 +308,7 @@ struct Sf2GenState {
     int16_t vib_lfo_to_pitch;
     int16_t mod_env_to_pitch;
     int16_t initial_filter_fc;
+    int16_t initial_filter_q;   /* Filter resonance (centibels) */
     int16_t mod_lfo_to_filter_fc;
     int16_t mod_env_to_filter_fc;
     int16_t mod_lfo_to_volume;
@@ -305,7 +339,8 @@ struct Sf2GenState {
 
 static void sf2_gen_defaults(struct Sf2GenState *state) {
     memset(state, 0, sizeof(*state));
-    state->initial_filter_fc = 13500;
+    state->initial_filter_fc = 13500;  /* SF2 default: 13500 cents = ~8kHz */
+    state->initial_filter_q = 0;       /* SF2 default: 0 centibels (no resonance) */
     state->delay_mod_lfo = -12000;
     state->freq_mod_lfo = 0;
     state->delay_vib_lfo = -12000;
@@ -329,204 +364,65 @@ static void sf2_gen_defaults(struct Sf2GenState *state) {
     state->reverb_send = 0;
 }
 
+/* Apply a single generator value to state (internal helper) */
+static void sf2_apply_single_generator(struct Sf2GenState *state, uint16_t oper,
+                                       int16_t val, int preset_relative) {
+    /* Helper macro to apply value with optional relative mode */
+    #define APPLY_GEN(field) \
+        state->field = preset_relative ? (state->field + val) : val
+
+    switch (oper) {
+        case GEN_MOD_LFO_TO_PITCH:     APPLY_GEN(mod_lfo_to_pitch); break;
+        case GEN_VIB_LFO_TO_PITCH:     APPLY_GEN(vib_lfo_to_pitch); break;
+        case GEN_MOD_ENV_TO_PITCH:     APPLY_GEN(mod_env_to_pitch); break;
+        case GEN_INITIAL_FILTER_FC:    APPLY_GEN(initial_filter_fc); break;
+        case GEN_INITIAL_FILTER_Q:     APPLY_GEN(initial_filter_q); break;
+        case GEN_MOD_LFO_TO_FILTER_FC: APPLY_GEN(mod_lfo_to_filter_fc); break;
+        case GEN_MOD_ENV_TO_FILTER_FC: APPLY_GEN(mod_env_to_filter_fc); break;
+        case GEN_MOD_LFO_TO_VOLUME:    APPLY_GEN(mod_lfo_to_volume); break;
+        case GEN_DELAY_MOD_LFO:        APPLY_GEN(delay_mod_lfo); break;
+        case GEN_FREQ_MOD_LFO:         APPLY_GEN(freq_mod_lfo); break;
+        case GEN_DELAY_VIB_LFO:        APPLY_GEN(delay_vib_lfo); break;
+        case GEN_FREQ_VIB_LFO:         APPLY_GEN(freq_vib_lfo); break;
+        case GEN_DELAY_MOD_ENV:        APPLY_GEN(delay_mod_env); break;
+        case GEN_ATTACK_MOD_ENV:       APPLY_GEN(attack_mod_env); break;
+        case GEN_HOLD_MOD_ENV:         APPLY_GEN(hold_mod_env); break;
+        case GEN_DECAY_MOD_ENV:        APPLY_GEN(decay_mod_env); break;
+        case GEN_SUSTAIN_MOD_ENV:      APPLY_GEN(sustain_mod_env); break;
+        case GEN_RELEASE_MOD_ENV:      APPLY_GEN(release_mod_env); break;
+        case GEN_DELAY_VOL_ENV:        APPLY_GEN(delay_vol_env); break;
+        case GEN_ATTACK_VOL_ENV:       APPLY_GEN(attack_vol_env); break;
+        case GEN_HOLD_VOL_ENV:         APPLY_GEN(hold_vol_env); break;
+        case GEN_DECAY_VOL_ENV:        APPLY_GEN(decay_vol_env); break;
+        case GEN_SUSTAIN_VOL_ENV:      APPLY_GEN(sustain_vol_env); break;
+        case GEN_RELEASE_VOL_ENV:      APPLY_GEN(release_vol_env); break;
+        case GEN_INITIAL_ATTENUATION:  APPLY_GEN(initial_attenuation); break;
+        case GEN_COARSE_TUNE:          APPLY_GEN(coarse_tune); break;
+        case GEN_FINE_TUNE:            APPLY_GEN(fine_tune); break;
+        case GEN_PAN:                  APPLY_GEN(pan); break;
+        case GEN_CHORUS_EFFECTS_SEND:  APPLY_GEN(chorus_send); break;
+        case GEN_REVERB_EFFECTS_SEND:  APPLY_GEN(reverb_send); break;
+        case GEN_EXCLUSIVE_CLASS:      APPLY_GEN(exclusive_class); break;
+        default: break;
+    }
+    #undef APPLY_GEN
+}
+
+/* Apply instrument generators to state */
 static void sf2_apply_generators(struct Sf2GenState *state, struct sfInstGenList *gens,
                                  int gen_start, int gen_end, int preset_relative) {
     for (int i = gen_start; i < gen_end; i++) {
-        struct sfInstGenList *gen = &gens[i];
-        int16_t val = gen->genAmount.shAmount;
-        switch (gen->sfGenOper) {
-            case GEN_MOD_LFO_TO_PITCH:
-                state->mod_lfo_to_pitch = preset_relative ? (state->mod_lfo_to_pitch + val) : val;
-                break;
-            case GEN_VIB_LFO_TO_PITCH:
-                state->vib_lfo_to_pitch = preset_relative ? (state->vib_lfo_to_pitch + val) : val;
-                break;
-            case GEN_MOD_ENV_TO_PITCH:
-                state->mod_env_to_pitch = preset_relative ? (state->mod_env_to_pitch + val) : val;
-                break;
-            case GEN_INITIAL_FILTER_FC:
-                state->initial_filter_fc = preset_relative ? (state->initial_filter_fc + val) : val;
-                break;
-            case GEN_MOD_LFO_TO_FILTER_FC:
-                state->mod_lfo_to_filter_fc = preset_relative ? (state->mod_lfo_to_filter_fc + val) : val;
-                break;
-            case GEN_MOD_ENV_TO_FILTER_FC:
-                state->mod_env_to_filter_fc = preset_relative ? (state->mod_env_to_filter_fc + val) : val;
-                break;
-            case GEN_MOD_LFO_TO_VOLUME:
-                state->mod_lfo_to_volume = preset_relative ? (state->mod_lfo_to_volume + val) : val;
-                break;
-            case GEN_DELAY_MOD_LFO:
-                state->delay_mod_lfo = preset_relative ? (state->delay_mod_lfo + val) : val;
-                break;
-            case GEN_FREQ_MOD_LFO:
-                state->freq_mod_lfo = preset_relative ? (state->freq_mod_lfo + val) : val;
-                break;
-            case GEN_DELAY_VIB_LFO:
-                state->delay_vib_lfo = preset_relative ? (state->delay_vib_lfo + val) : val;
-                break;
-            case GEN_FREQ_VIB_LFO:
-                state->freq_vib_lfo = preset_relative ? (state->freq_vib_lfo + val) : val;
-                break;
-            case GEN_DELAY_MOD_ENV:
-                state->delay_mod_env = preset_relative ? (state->delay_mod_env + val) : val;
-                break;
-            case GEN_ATTACK_MOD_ENV:
-                state->attack_mod_env = preset_relative ? (state->attack_mod_env + val) : val;
-                break;
-            case GEN_HOLD_MOD_ENV:
-                state->hold_mod_env = preset_relative ? (state->hold_mod_env + val) : val;
-                break;
-            case GEN_DECAY_MOD_ENV:
-                state->decay_mod_env = preset_relative ? (state->decay_mod_env + val) : val;
-                break;
-            case GEN_SUSTAIN_MOD_ENV:
-                state->sustain_mod_env = preset_relative ? (state->sustain_mod_env + val) : val;
-                break;
-            case GEN_RELEASE_MOD_ENV:
-                state->release_mod_env = preset_relative ? (state->release_mod_env + val) : val;
-                break;
-            case GEN_DELAY_VOL_ENV:
-                state->delay_vol_env = preset_relative ? (state->delay_vol_env + val) : val;
-                break;
-            case GEN_ATTACK_VOL_ENV:
-                state->attack_vol_env = preset_relative ? (state->attack_vol_env + val) : val;
-                break;
-            case GEN_HOLD_VOL_ENV:
-                state->hold_vol_env = preset_relative ? (state->hold_vol_env + val) : val;
-                break;
-            case GEN_DECAY_VOL_ENV:
-                state->decay_vol_env = preset_relative ? (state->decay_vol_env + val) : val;
-                break;
-            case GEN_SUSTAIN_VOL_ENV:
-                state->sustain_vol_env = preset_relative ? (state->sustain_vol_env + val) : val;
-                break;
-            case GEN_RELEASE_VOL_ENV:
-                state->release_vol_env = preset_relative ? (state->release_vol_env + val) : val;
-                break;
-            case GEN_INITIAL_ATTENUATION:
-                state->initial_attenuation = preset_relative ? (state->initial_attenuation + val) : val;
-                break;
-            case GEN_COARSE_TUNE:
-                state->coarse_tune = preset_relative ? (state->coarse_tune + val) : val;
-                break;
-            case GEN_FINE_TUNE:
-                state->fine_tune = preset_relative ? (state->fine_tune + val) : val;
-                break;
-            case GEN_PAN:
-                state->pan = preset_relative ? (state->pan + val) : val;
-                break;
-            case GEN_CHORUS_EFFECTS_SEND:
-                state->chorus_send = preset_relative ? (state->chorus_send + val) : val;
-                break;
-            case GEN_REVERB_EFFECTS_SEND:
-                state->reverb_send = preset_relative ? (state->reverb_send + val) : val;
-                break;
-            case GEN_EXCLUSIVE_CLASS:
-                state->exclusive_class = preset_relative ? (state->exclusive_class + val) : val;
-                break;
-            default:
-                break;
-        }
+        sf2_apply_single_generator(state, gens[i].sfGenOper,
+                                   gens[i].genAmount.shAmount, preset_relative);
     }
 }
 
+/* Apply preset generators to state */
 static void sf2_apply_preset_generators(struct Sf2GenState *state, struct sfGenList *gens,
                                         int gen_start, int gen_end, int preset_relative) {
     for (int i = gen_start; i < gen_end; i++) {
-        struct sfGenList *gen = &gens[i];
-        int16_t val = gen->genAmount.shAmount;
-        switch (gen->sfGenOper) {
-            case GEN_MOD_LFO_TO_PITCH:
-                state->mod_lfo_to_pitch = preset_relative ? (state->mod_lfo_to_pitch + val) : val;
-                break;
-            case GEN_VIB_LFO_TO_PITCH:
-                state->vib_lfo_to_pitch = preset_relative ? (state->vib_lfo_to_pitch + val) : val;
-                break;
-            case GEN_MOD_ENV_TO_PITCH:
-                state->mod_env_to_pitch = preset_relative ? (state->mod_env_to_pitch + val) : val;
-                break;
-            case GEN_INITIAL_FILTER_FC:
-                state->initial_filter_fc = preset_relative ? (state->initial_filter_fc + val) : val;
-                break;
-            case GEN_MOD_LFO_TO_FILTER_FC:
-                state->mod_lfo_to_filter_fc = preset_relative ? (state->mod_lfo_to_filter_fc + val) : val;
-                break;
-            case GEN_MOD_ENV_TO_FILTER_FC:
-                state->mod_env_to_filter_fc = preset_relative ? (state->mod_env_to_filter_fc + val) : val;
-                break;
-            case GEN_MOD_LFO_TO_VOLUME:
-                state->mod_lfo_to_volume = preset_relative ? (state->mod_lfo_to_volume + val) : val;
-                break;
-            case GEN_DELAY_MOD_LFO:
-                state->delay_mod_lfo = preset_relative ? (state->delay_mod_lfo + val) : val;
-                break;
-            case GEN_FREQ_MOD_LFO:
-                state->freq_mod_lfo = preset_relative ? (state->freq_mod_lfo + val) : val;
-                break;
-            case GEN_DELAY_VIB_LFO:
-                state->delay_vib_lfo = preset_relative ? (state->delay_vib_lfo + val) : val;
-                break;
-            case GEN_FREQ_VIB_LFO:
-                state->freq_vib_lfo = preset_relative ? (state->freq_vib_lfo + val) : val;
-                break;
-            case GEN_DELAY_MOD_ENV:
-                state->delay_mod_env = preset_relative ? (state->delay_mod_env + val) : val;
-                break;
-            case GEN_ATTACK_MOD_ENV:
-                state->attack_mod_env = preset_relative ? (state->attack_mod_env + val) : val;
-                break;
-            case GEN_HOLD_MOD_ENV:
-                state->hold_mod_env = preset_relative ? (state->hold_mod_env + val) : val;
-                break;
-            case GEN_DECAY_MOD_ENV:
-                state->decay_mod_env = preset_relative ? (state->decay_mod_env + val) : val;
-                break;
-            case GEN_SUSTAIN_MOD_ENV:
-                state->sustain_mod_env = preset_relative ? (state->sustain_mod_env + val) : val;
-                break;
-            case GEN_RELEASE_MOD_ENV:
-                state->release_mod_env = preset_relative ? (state->release_mod_env + val) : val;
-                break;
-            case GEN_DELAY_VOL_ENV:
-                state->delay_vol_env = preset_relative ? (state->delay_vol_env + val) : val;
-                break;
-            case GEN_ATTACK_VOL_ENV:
-                state->attack_vol_env = preset_relative ? (state->attack_vol_env + val) : val;
-                break;
-            case GEN_HOLD_VOL_ENV:
-                state->hold_vol_env = preset_relative ? (state->hold_vol_env + val) : val;
-                break;
-            case GEN_DECAY_VOL_ENV:
-                state->decay_vol_env = preset_relative ? (state->decay_vol_env + val) : val;
-                break;
-            case GEN_SUSTAIN_VOL_ENV:
-                state->sustain_vol_env = preset_relative ? (state->sustain_vol_env + val) : val;
-                break;
-            case GEN_RELEASE_VOL_ENV:
-                state->release_vol_env = preset_relative ? (state->release_vol_env + val) : val;
-                break;
-            case GEN_INITIAL_ATTENUATION:
-                state->initial_attenuation = preset_relative ? (state->initial_attenuation + val) : val;
-                break;
-            case GEN_COARSE_TUNE:
-                state->coarse_tune = preset_relative ? (state->coarse_tune + val) : val;
-                break;
-            case GEN_FINE_TUNE:
-                state->fine_tune = preset_relative ? (state->fine_tune + val) : val;
-                break;
-            case GEN_PAN:
-                state->pan = preset_relative ? (state->pan + val) : val;
-                break;
-            case GEN_CHORUS_EFFECTS_SEND:
-                state->chorus_send = preset_relative ? (state->chorus_send + val) : val;
-                break;
-            case GEN_REVERB_EFFECTS_SEND:
-                state->reverb_send = preset_relative ? (state->reverb_send + val) : val;
-                break;
-            default:
-                break;
-        }
+        sf2_apply_single_generator(state, gens[i].sfGenOper,
+                                   gens[i].genAmount.shAmount, preset_relative);
     }
 }
 
@@ -627,12 +523,18 @@ static void apply_sf2_state_to_patch(struct PATCH *patch, const struct Sf2GenSta
         patch->cFC1MAmount = cents_to_amount(state->mod_lfo_to_filter_fc, 100);
     }
 
+    /* Apply filter cutoff bias relative to SF2 default of 13500 cents (~8kHz) */
     {
         int bias = (state->initial_filter_fc - 13500) / 100;
         if (bias < -127) bias = -127;
         if (bias > 127) bias = 127;
         patch->cFC1FreqBias = (int8_t)bias;
     }
+
+    /* Note: SF2 initial_filter_q (resonance) is tracked but cannot be mapped
+     * because WaveFront's ICS2115 filter doesn't have a resonance parameter.
+     * The filter only supports cutoff bias, modulation source/amount, and key scaling. */
+    (void)state->initial_filter_q;  /* Suppress unused warning */
 }
 
 static uint8_t sf2_pan_to_wf(int16_t pan) {
@@ -761,23 +663,24 @@ static void apply_layer_split(struct LAYER *layer, uint8_t key_lo, uint8_t key_h
     }
 }
 
+/* Count unique sample indices in O(n) using a bitset */
 static int count_unique_samples(const int16_t *samples) {
-    int16_t unique[NUM_MIDIKEYS];
+    /* Bitset for tracking seen samples (512 bits = 64 bytes for WF_MAX_SAMPLES) */
+    uint64_t seen[WF_MAX_SAMPLES / 64];
     int count = 0;
+
+    memset(seen, 0, sizeof(seen));
+
     for (int i = 0; i < NUM_MIDIKEYS; i++) {
         int16_t val = samples[i];
-        if (val < 0) {
+        if (val < 0 || val >= WF_MAX_SAMPLES) {
             continue;
         }
-        int found = 0;
-        for (int j = 0; j < count; j++) {
-            if (unique[j] == val) {
-                found = 1;
-                break;
-            }
-        }
-        if (!found && count < NUM_MIDIKEYS) {
-            unique[count++] = val;
+        int word = val / 64;
+        uint64_t bit = 1ULL << (val % 64);
+        if (!(seen[word] & bit)) {
+            seen[word] |= bit;
+            count++;
         }
     }
     return count;
@@ -837,7 +740,7 @@ static int sf2_find_stereo_pair(struct SF2Bank *sf2, int sample_idx, int *left_i
 
 /* Add a sample to the WFB bank */
 static int add_sample(struct WFBBank *wfb, struct SF2Bank *sf2, int sf2_sample_idx,
-                      int *resampled_count) {
+                      int *resampled_count, struct ConversionContext *ctx) {
     struct sfSample *sf2_samp;
     struct WaveFrontExtendedSampleInfo *info;
     struct SAMPLE temp_sample;
@@ -854,9 +757,9 @@ static int add_sample(struct WFBBank *wfb, struct SF2Bank *sf2, int sf2_sample_i
         return -1;
     }
 
-    if (g_sf2_sample_map && sf2_sample_idx < g_sf2_sample_map_count) {
-        if (g_sf2_sample_map[sf2_sample_idx] >= 0) {
-            return g_sf2_sample_map[sf2_sample_idx];
+    if (ctx->sf2_sample_map && sf2_sample_idx < ctx->sf2_sample_map_count) {
+        if (ctx->sf2_sample_map[sf2_sample_idx] >= 0) {
+            return ctx->sf2_sample_map[sf2_sample_idx];
         }
     }
 
@@ -970,9 +873,9 @@ static int add_sample(struct WFBBank *wfb, struct SF2Bank *sf2, int sf2_sample_i
         wfb->samples[wfb_idx].data_hash = 0;
 
         wfb->sample_count++;
-        g_dedupe_alias_count++;
-        if (g_sf2_sample_map && sf2_sample_idx < g_sf2_sample_map_count) {
-            g_sf2_sample_map[sf2_sample_idx] = wfb_idx;
+        ctx->dedupe_alias_count++;
+        if (ctx->sf2_sample_map && sf2_sample_idx < ctx->sf2_sample_map_count) {
+            ctx->sf2_sample_map[sf2_sample_idx] = wfb_idx;
         }
         free(sample_data);
         return wfb_idx;
@@ -998,8 +901,8 @@ static int add_sample(struct WFBBank *wfb, struct SF2Bank *sf2, int sf2_sample_i
     wfb->total_sample_memory += info->dwSizeInBytes;
     wfb->sample_count++;
 
-    if (g_sf2_sample_map && sf2_sample_idx < g_sf2_sample_map_count) {
-        g_sf2_sample_map[sf2_sample_idx] = wfb_idx;
+    if (ctx->sf2_sample_map && sf2_sample_idx < ctx->sf2_sample_map_count) {
+        ctx->sf2_sample_map[sf2_sample_idx] = wfb_idx;
     }
 
     return wfb_idx;
@@ -1047,7 +950,7 @@ int add_multisample_entry(struct WFBBank *wfb, const int16_t *sample_numbers,
 /* Convert a single SF2 preset to WFB program */
 static int convert_preset(struct WFBBank *wfb, struct SF2Bank *sf2,
                          struct sfPresetHeader *preset, int prog_num,
-                         int *resampled_count) {
+                         int *resampled_count, struct ConversionContext *ctx) {
     struct WaveFrontProgram *wf_prog;
     struct WaveFrontPatch *wf_patch;
     int bag_start, bag_end;
@@ -1298,7 +1201,7 @@ static int convert_preset(struct WFBBank *wfb, struct SF2Bank *sf2,
             drop_reason = 1;
             break;
         }
-        int patch_limit = WF_MAX_PATCHES - g_patch_reserve;
+        int patch_limit = WF_MAX_PATCHES - ctx->patch_reserve;
         if (patch_limit < 0) {
             patch_limit = 0;
         }
@@ -1327,14 +1230,14 @@ static int convert_preset(struct WFBBank *wfb, struct SF2Bank *sf2,
             ms_numbers[k] = -1;
             ms_numbers_r[k] = -1;
             if (groups[g].sample_idx[k] >= 0) {
-                int wfb_idx = add_sample(wfb, sf2, groups[g].sample_idx[k], resampled_count);
+                int wfb_idx = add_sample(wfb, sf2, groups[g].sample_idx[k], resampled_count, ctx);
                 if (wfb_idx >= 0) {
                     ms_numbers[k] = (int16_t)wfb_idx;
                     mapped_keys++;
                 }
             }
             if (has_right && groups[g].sample_idx_r[k] >= 0) {
-                int wfb_idx = add_sample(wfb, sf2, groups[g].sample_idx_r[k], resampled_count);
+                int wfb_idx = add_sample(wfb, sf2, groups[g].sample_idx_r[k], resampled_count, ctx);
                 if (wfb_idx >= 0) {
                     ms_numbers_r[k] = (int16_t)wfb_idx;
                     mapped_keys_r++;
@@ -1384,7 +1287,8 @@ static int convert_preset(struct WFBBank *wfb, struct SF2Bank *sf2,
         layer->byPatchNumber = wfb->patch_count;
         layer->fMixLevel = 127;
         layer->fUnmute = 1;
-        layer->fPan = groups[g].pan;
+        /* For stereo pairs, left channel gets hard-left (0); mono uses zone pan */
+        layer->fPan = has_right ? 0 : groups[g].pan;
         apply_layer_split(layer, 0, 127, groups[g].vel_lo, groups[g].vel_hi);
         wfb->patch_count++;
         layer_idx++;
@@ -1433,7 +1337,7 @@ static int convert_preset(struct WFBBank *wfb, struct SF2Bank *sf2,
         }
     }
 
-    if (g_verbose && dropped_groups > 0) {
+    if (ctx->verbose && dropped_groups > 0) {
         if (drop_reason == 1) {
             fprintf(stderr,
                     "Warning: Program %d (\"%s\") has %d zone groups; only %d layers available. %d group(s) dropped.\n",
@@ -1441,11 +1345,11 @@ static int convert_preset(struct WFBBank *wfb, struct SF2Bank *sf2,
         } else if (drop_reason == 2) {
             fprintf(stderr,
                     "Warning: Program %d (\"%s\") dropped %d zone group(s) due to patch limit (%d).\n",
-                    prog_num, preset->achPresetName, dropped_groups, WF_MAX_PATCHES - g_patch_reserve);
+                    prog_num, preset->achPresetName, dropped_groups, WF_MAX_PATCHES - ctx->patch_reserve);
         }
     }
 
-    if (g_verbose) {
+    if (ctx->verbose) {
         if (preset_chorus_max > 0) {
             fprintf(stderr,
                     "Notice: Program %d (\"%s\") chorus send up to %.1f%% (SF2).\n",
@@ -1463,7 +1367,8 @@ static int convert_preset(struct WFBBank *wfb, struct SF2Bank *sf2,
 }
 
 static int convert_drumkit(struct WFBBank *wfb, struct SF2Bank *sf2,
-                           struct sfPresetHeader *preset, int *resampled_count) {
+                           struct sfPresetHeader *preset, int *resampled_count,
+                           struct ConversionContext *ctx) {
     int bag_start, bag_end;
     int preset_global_gen_start = -1;
     int preset_global_gen_end = -1;
@@ -1601,7 +1506,7 @@ static int convert_drumkit(struct WFBBank *wfb, struct SF2Bank *sf2,
                 wf_patch->base.fReuse = 1;
             }
 
-            int wfb_sample_idx = add_sample(wfb, sf2, sample_idx, resampled_count);
+            int wfb_sample_idx = add_sample(wfb, sf2, sample_idx, resampled_count, ctx);
             if (wfb_sample_idx >= 0) {
                 wf_patch->base.bySampleNumber = wfb_sample_idx;
             }
@@ -1640,26 +1545,18 @@ int convert_sf2_to_wfb(const char *input_file, const char *output_file,
                        struct ConversionOptions *opts) {
     struct SF2Bank sf2;
     struct WFBBank wfb;
+    struct ConversionContext ctx;
     int i, resampled_count = 0;
     int discarded_samples = 0;
     uint32_t memory_limit;
-
-    g_verbose = (opts && opts->verbose) ? 1 : 0;
 
     /* Open SF2 file */
     if (sf2_open(input_file, &sf2) != 0) {
         return -1;
     }
 
-    g_sf2_sample_map = malloc((size_t)sf2.sample_count * sizeof(int));
-    if (g_sf2_sample_map) {
-        g_sf2_sample_map_count = sf2.sample_count;
-        for (i = 0; i < g_sf2_sample_map_count; i++) {
-            g_sf2_sample_map[i] = -1;
-        }
-    } else {
-        g_sf2_sample_map_count = 0;
-    }
+    /* Initialize conversion context */
+    init_conversion_context(&ctx, sf2.sample_count, opts && opts->verbose);
 
     /* Initialize WFB bank */
     init_wfb_bank(&wfb, opts->device_name ? opts->device_name : "Maui");
@@ -1671,17 +1568,17 @@ int convert_sf2_to_wfb(const char *input_file, const char *output_file,
             drums_probe = sf2_get_preset(&sf2, 0, 128);
         }
         if (drums_probe) {
-            g_patch_reserve = 47; /* Reserve for Drumkit keys 35-81 */
+            ctx.patch_reserve = 47; /* Reserve for Drumkit keys 35-81 */
         } else {
-            g_patch_reserve = 0;
+            ctx.patch_reserve = 0;
         }
     } else {
-        g_patch_reserve = 0;
+        ctx.patch_reserve = 0;
     }
     for (i = 0; i < 128; i++) {
         struct sfPresetHeader *preset = sf2_get_preset(&sf2, 0, i);
         if (preset) {
-            if (convert_preset(&wfb, &sf2, preset, i, &resampled_count) != 0) {
+            if (convert_preset(&wfb, &sf2, preset, i, &resampled_count, &ctx) != 0) {
                 fprintf(stderr, "Warning: Failed to convert preset %d\n", i);
             }
         }
@@ -1700,7 +1597,7 @@ int convert_sf2_to_wfb(const char *input_file, const char *output_file,
         }
 
         if (drums) {
-            if (convert_drumkit(&wfb, &sf2, drums, &resampled_count) != 0) {
+            if (convert_drumkit(&wfb, &sf2, drums, &resampled_count, &ctx) != 0) {
                 fprintf(stderr, "Warning: Failed to convert drumkit\n");
             }
         }
@@ -1732,14 +1629,15 @@ int convert_sf2_to_wfb(const char *input_file, const char *output_file,
     const char *final_output = output_file ? output_file : get_auto_increment_filename(output_file);
     if (wfb_write(final_output, &wfb) != 0) {
         sf2_close(&sf2);
+        free_conversion_context(&ctx);
         return -1;
     }
 
     printf("Conversion complete: '%s' -> '%s'\n", input_file, final_output);
     printf("  Programs: %d, Patches: %d, Samples: %d\n",
            wfb.program_count, wfb.patch_count, wfb.sample_count);
-    if (g_dedupe_alias_count > 0) {
-        printf("  Deduped samples (aliases): %d\n", g_dedupe_alias_count);
+    if (ctx.dedupe_alias_count > 0) {
+        printf("  Deduped samples (aliases): %d\n", ctx.dedupe_alias_count);
     }
     if (resampled_count > 0) {
         printf("  Resampled: %d samples\n", resampled_count);
@@ -1753,10 +1651,7 @@ int convert_sf2_to_wfb(const char *input_file, const char *output_file,
     for (i = 0; i < wfb.sample_count; i++) {
         free(wfb.samples[i].pcm_data);
     }
-    free(g_sf2_sample_map);
-    g_sf2_sample_map = NULL;
-    g_sf2_sample_map_count = 0;
-    g_verbose = 0;
+    free_conversion_context(&ctx);
 
     return 0;
 }

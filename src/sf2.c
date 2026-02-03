@@ -61,6 +61,22 @@ static int find_list_chunk(FILE *f, const char *list_type, uint32_t *size) {
     return -1;
 }
 
+/* Helper macro to allocate and read a chunk with error checking */
+#define READ_CHUNK_DATA(ptr, size, count_field, struct_size) do { \
+    (count_field) = (size) / sizeof(struct_size) - 1; \
+    (ptr) = malloc(size); \
+    if (!(ptr)) { \
+        fprintf(stderr, "Error: Failed to allocate memory for chunk\n"); \
+        return -1; \
+    } \
+    if (fread((ptr), (size), 1, f) != 1) { \
+        fprintf(stderr, "Error: Failed to read chunk data\n"); \
+        free(ptr); \
+        (ptr) = NULL; \
+        return -1; \
+    } \
+} while (0)
+
 /* Parse the pdta (preset data) section */
 static int parse_hydra(FILE *f, struct SF2Bank *bank) {
     struct RIFFChunk chunk;
@@ -76,53 +92,44 @@ static int parse_hydra(FILE *f, struct SF2Bank *bank) {
     pdta_start = ftell(f);
 
     /* Read each sub-chunk */
-    while (ftell(f) < pdta_start + pdta_size) {
+    while (ftell(f) < pdta_start + (long)pdta_size) {
         if (read_chunk(f, &chunk) != 0) break;
 
         if (memcmp(chunk.chunkID, "phdr", 4) == 0) {
-            bank->preset_count = chunk.chunkSize / sizeof(struct sfPresetHeader) - 1;
-            bank->presets = malloc(chunk.chunkSize);
-            fread(bank->presets, chunk.chunkSize, 1, f);
+            READ_CHUNK_DATA(bank->presets, chunk.chunkSize,
+                           bank->preset_count, struct sfPresetHeader);
         }
         else if (memcmp(chunk.chunkID, "pbag", 4) == 0) {
-            bank->preset_bag_count = chunk.chunkSize / sizeof(struct sfPresetBag) - 1;
-            bank->preset_bags = malloc(chunk.chunkSize);
-            fread(bank->preset_bags, chunk.chunkSize, 1, f);
+            READ_CHUNK_DATA(bank->preset_bags, chunk.chunkSize,
+                           bank->preset_bag_count, struct sfPresetBag);
         }
         else if (memcmp(chunk.chunkID, "pmod", 4) == 0) {
-            bank->preset_mod_count = chunk.chunkSize / sizeof(struct sfModList) - 1;
-            bank->preset_mods = malloc(chunk.chunkSize);
-            fread(bank->preset_mods, chunk.chunkSize, 1, f);
+            READ_CHUNK_DATA(bank->preset_mods, chunk.chunkSize,
+                           bank->preset_mod_count, struct sfModList);
         }
         else if (memcmp(chunk.chunkID, "pgen", 4) == 0) {
-            bank->preset_gen_count = chunk.chunkSize / sizeof(struct sfGenList) - 1;
-            bank->preset_gens = malloc(chunk.chunkSize);
-            fread(bank->preset_gens, chunk.chunkSize, 1, f);
+            READ_CHUNK_DATA(bank->preset_gens, chunk.chunkSize,
+                           bank->preset_gen_count, struct sfGenList);
         }
         else if (memcmp(chunk.chunkID, "inst", 4) == 0) {
-            bank->inst_count = chunk.chunkSize / sizeof(struct sfInst) - 1;
-            bank->instruments = malloc(chunk.chunkSize);
-            fread(bank->instruments, chunk.chunkSize, 1, f);
+            READ_CHUNK_DATA(bank->instruments, chunk.chunkSize,
+                           bank->inst_count, struct sfInst);
         }
         else if (memcmp(chunk.chunkID, "ibag", 4) == 0) {
-            bank->inst_bag_count = chunk.chunkSize / sizeof(struct sfInstBag) - 1;
-            bank->inst_bags = malloc(chunk.chunkSize);
-            fread(bank->inst_bags, chunk.chunkSize, 1, f);
+            READ_CHUNK_DATA(bank->inst_bags, chunk.chunkSize,
+                           bank->inst_bag_count, struct sfInstBag);
         }
         else if (memcmp(chunk.chunkID, "imod", 4) == 0) {
-            bank->inst_mod_count = chunk.chunkSize / sizeof(struct sfInstModList) - 1;
-            bank->inst_mods = malloc(chunk.chunkSize);
-            fread(bank->inst_mods, chunk.chunkSize, 1, f);
+            READ_CHUNK_DATA(bank->inst_mods, chunk.chunkSize,
+                           bank->inst_mod_count, struct sfInstModList);
         }
         else if (memcmp(chunk.chunkID, "igen", 4) == 0) {
-            bank->inst_gen_count = chunk.chunkSize / sizeof(struct sfInstGenList) - 1;
-            bank->inst_gens = malloc(chunk.chunkSize);
-            fread(bank->inst_gens, chunk.chunkSize, 1, f);
+            READ_CHUNK_DATA(bank->inst_gens, chunk.chunkSize,
+                           bank->inst_gen_count, struct sfInstGenList);
         }
         else if (memcmp(chunk.chunkID, "shdr", 4) == 0) {
-            bank->sample_count = chunk.chunkSize / sizeof(struct sfSample) - 1;
-            bank->samples = malloc(chunk.chunkSize);
-            fread(bank->samples, chunk.chunkSize, 1, f);
+            READ_CHUNK_DATA(bank->samples, chunk.chunkSize,
+                           bank->sample_count, struct sfSample);
         }
         else {
             /* Skip unknown chunk */
@@ -137,6 +144,8 @@ static int parse_hydra(FILE *f, struct SF2Bank *bank) {
 
     return 0;
 }
+
+#undef READ_CHUNK_DATA
 
 /* Parse the sdta (sample data) section */
 static int parse_sample_data(FILE *f, struct SF2Bank *bank) {
