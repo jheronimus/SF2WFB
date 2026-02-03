@@ -28,6 +28,7 @@ static void print_usage(const char *prog_name) {
     printf("  -p, --patch <file>:<id>  Replace program ID with preset from file\n");
     printf("                           Can be used multiple times\n");
     printf("  -o, --output <path>      Output filename (single file only)\n");
+    printf("  -v, --verbose            Enable verbose warnings\n");
     printf("  -h, --help               Show this help message\n");
     printf("\nExamples:\n");
     printf("  %s piano.sf2\n", prog_name);
@@ -188,6 +189,7 @@ int main(int argc, char *argv[]) {
         {"drums",   required_argument, 0, 'D'},
         {"patch",   required_argument, 0, 'p'},
         {"output",  required_argument, 0, 'o'},
+        {"verbose", no_argument,       0, 'v'},
         {"help",    no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -197,7 +199,7 @@ int main(int argc, char *argv[]) {
     opts.device_name = NULL;  /* Default - will be set to Maui for conversions */
 
     /* Parse command-line arguments */
-    while ((opt = getopt_long(argc, argv, "d:D:p:o:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:D:p:o:vh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'd':
                 if (!is_valid_device_name(optarg)) {
@@ -237,6 +239,9 @@ int main(int argc, char *argv[]) {
 
                     opts.patch_count++;
                 }
+                break;
+            case 'v':
+                opts.verbose = 1;
                 break;
 
             case 'o':

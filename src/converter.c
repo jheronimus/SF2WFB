@@ -32,6 +32,89 @@ static int sample_offsets_equal(const struct SAMPLE_OFFSET *a, const struct SAMP
 }
 
 static int g_dedupe_alias_count = 0;
+static int g_patch_reserve = 0;
+static int *g_sf2_sample_map = NULL;
+static int g_sf2_sample_map_count = 0;
+static int g_verbose = 0;
+
+static int patch_base_equal(const struct PATCH *a, const struct PATCH *b) {
+    return memcmp(a, b, sizeof(*a)) == 0;
+}
+
+static int8_t cents_to_amount(int16_t cents, int16_t scale);
+static int8_t centibels_to_amount(int16_t centibels, int16_t scale);
+
+static int wf_mod_source_from_sf2(uint16_t srcOper) {
+    if (srcOper == 0) {
+        return -1;
+    }
+    int is_cc = (srcOper & 0x80) != 0;
+    int index = srcOper & 0x7F;
+    if (is_cc) {
+        switch (index) {
+            case 1:  return 10; /* Mod Wheel */
+            case 2:  return 11; /* Breath */
+            case 4:  return 12; /* Foot */
+            case 7:  return 13; /* Volume */
+            case 10: return 14; /* Pan */
+            case 11: return 15; /* Expression */
+            default: return -1;
+        }
+    }
+    switch (index) {
+        case 2:  return 6;  /* Velocity */
+        case 3:  return 4;  /* Key Number */
+        case 13: return 9;  /* Channel Pressure */
+        default: return -1;
+    }
+}
+
+static void apply_modulator_to_patch(struct PATCH *patch, uint16_t destOper,
+                                     int16_t amount, int wf_source) {
+    if (!patch || wf_source < 0) {
+        return;
+    }
+    switch (destOper) {
+        case GEN_INITIAL_ATTENUATION:
+            patch->fAMSource = wf_source;
+            patch->cAMAmount = centibels_to_amount(amount, 5);
+            break;
+        case GEN_INITIAL_FILTER_FC:
+        case GEN_MOD_LFO_TO_FILTER_FC:
+        case GEN_MOD_ENV_TO_FILTER_FC:
+            patch->fFC1MSource = wf_source;
+            patch->cFC1MAmount = cents_to_amount(amount, 100);
+            break;
+        case GEN_COARSE_TUNE:
+        case GEN_FINE_TUNE:
+        case GEN_MOD_LFO_TO_PITCH:
+        case GEN_VIB_LFO_TO_PITCH:
+        case GEN_MOD_ENV_TO_PITCH:
+            if (patch->fFMSource1 == 0 && patch->cFMAmount1 == 0) {
+                patch->fFMSource1 = wf_source;
+                patch->cFMAmount1 = cents_to_amount(amount, 10);
+            } else {
+                patch->fFMSource2 = wf_source;
+                patch->cFMAmount2 = cents_to_amount(amount, 10);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+static void apply_modulator_list_to_patch(struct PATCH *patch,
+                                          const struct sfModList *mods,
+                                          int mod_start, int mod_end) {
+    if (!mods || mod_start < 0 || mod_end <= mod_start) {
+        return;
+    }
+    for (int i = mod_start; i < mod_end; i++) {
+        int wf_source = wf_mod_source_from_sf2(mods[i].sfModSrcOper);
+        apply_modulator_to_patch(patch, mods[i].sfModDestOper,
+                                 mods[i].modAmount, wf_source);
+    }
+}
 static const float wf_time_table[128] = {
     0.0f, 0.008f, 0.009f, 0.010f, 0.012f, 0.013f, 0.015f, 0.016f,
     0.018f, 0.020f, 0.022f, 0.024f, 0.026f, 0.029f, 0.031f, 0.034f,
@@ -216,6 +299,8 @@ struct Sf2GenState {
     int16_t fine_tune;
     int16_t pan;
     int16_t exclusive_class;
+    int16_t chorus_send;
+    int16_t reverb_send;
 };
 
 static void sf2_gen_defaults(struct Sf2GenState *state) {
@@ -240,6 +325,8 @@ static void sf2_gen_defaults(struct Sf2GenState *state) {
     state->initial_attenuation = 0;
     state->pan = 0;
     state->exclusive_class = 0;
+    state->chorus_send = 0;
+    state->reverb_send = 0;
 }
 
 static void sf2_apply_generators(struct Sf2GenState *state, struct sfInstGenList *gens,
@@ -328,6 +415,12 @@ static void sf2_apply_generators(struct Sf2GenState *state, struct sfInstGenList
                 break;
             case GEN_PAN:
                 state->pan = preset_relative ? (state->pan + val) : val;
+                break;
+            case GEN_CHORUS_EFFECTS_SEND:
+                state->chorus_send = preset_relative ? (state->chorus_send + val) : val;
+                break;
+            case GEN_REVERB_EFFECTS_SEND:
+                state->reverb_send = preset_relative ? (state->reverb_send + val) : val;
                 break;
             case GEN_EXCLUSIVE_CLASS:
                 state->exclusive_class = preset_relative ? (state->exclusive_class + val) : val;
@@ -424,6 +517,12 @@ static void sf2_apply_preset_generators(struct Sf2GenState *state, struct sfGenL
                 break;
             case GEN_PAN:
                 state->pan = preset_relative ? (state->pan + val) : val;
+                break;
+            case GEN_CHORUS_EFFECTS_SEND:
+                state->chorus_send = preset_relative ? (state->chorus_send + val) : val;
+                break;
+            case GEN_REVERB_EFFECTS_SEND:
+                state->reverb_send = preset_relative ? (state->reverb_send + val) : val;
                 break;
             default:
                 break;
@@ -574,6 +673,116 @@ static int zone_matches_key_preset(struct sfGenList *gens, int gen_start, int ge
     return 1;
 }
 
+static void get_key_range_inst(struct sfInstGenList *gens, int gen_start, int gen_end,
+                               uint8_t *lo, uint8_t *hi) {
+    *lo = 0;
+    *hi = 127;
+    for (int i = gen_start; i < gen_end; i++) {
+        if (gens[i].sfGenOper == GEN_KEY_RANGE) {
+            *lo = gens[i].genAmount.range.byLo;
+            *hi = gens[i].genAmount.range.byHi;
+            return;
+        }
+    }
+}
+
+static void get_key_range_preset(struct sfGenList *gens, int gen_start, int gen_end,
+                                 uint8_t *lo, uint8_t *hi) {
+    *lo = 0;
+    *hi = 127;
+    for (int i = gen_start; i < gen_end; i++) {
+        if (gens[i].sfGenOper == GEN_KEY_RANGE) {
+            *lo = gens[i].genAmount.range.byLo;
+            *hi = gens[i].genAmount.range.byHi;
+            return;
+        }
+    }
+}
+
+static void get_vel_range_inst(struct sfInstGenList *gens, int gen_start, int gen_end,
+                               uint8_t *lo, uint8_t *hi) {
+    *lo = 0;
+    *hi = 127;
+    for (int i = gen_start; i < gen_end; i++) {
+        if (gens[i].sfGenOper == GEN_VEL_RANGE) {
+            *lo = gens[i].genAmount.range.byLo;
+            *hi = gens[i].genAmount.range.byHi;
+            return;
+        }
+    }
+}
+
+static void get_vel_range_preset(struct sfGenList *gens, int gen_start, int gen_end,
+                                 uint8_t *lo, uint8_t *hi) {
+    *lo = 0;
+    *hi = 127;
+    for (int i = gen_start; i < gen_end; i++) {
+        if (gens[i].sfGenOper == GEN_VEL_RANGE) {
+            *lo = gens[i].genAmount.range.byLo;
+            *hi = gens[i].genAmount.range.byHi;
+            return;
+        }
+    }
+}
+
+static void apply_layer_split(struct LAYER *layer, uint8_t key_lo, uint8_t key_hi,
+                              uint8_t vel_lo, uint8_t vel_hi) {
+    layer->fSplitType = 0;
+    layer->fSplitDir = 0;
+    layer->fSplitPoint = 0;
+
+    if (key_lo > 0 || key_hi < 127) {
+        layer->fSplitType = 0; /* key split */
+        if (key_lo > 0 && key_hi == 127) {
+            layer->fSplitDir = 0;
+            layer->fSplitPoint = key_lo;
+        } else if (key_lo == 0 && key_hi < 127) {
+            layer->fSplitDir = 1;
+            layer->fSplitPoint = key_hi;
+        } else {
+            layer->fSplitDir = 0;
+            layer->fSplitPoint = key_lo;
+        }
+        return;
+    }
+
+    if (vel_lo > 0 || vel_hi < 127) {
+        layer->fSplitType = 1; /* velocity split */
+        if (vel_lo > 0 && vel_hi == 127) {
+            layer->fSplitDir = 0;
+            layer->fSplitPoint = vel_lo;
+        } else if (vel_lo == 0 && vel_hi < 127) {
+            layer->fSplitDir = 1;
+            layer->fSplitPoint = vel_hi;
+        } else {
+            layer->fSplitDir = 0;
+            layer->fSplitPoint = vel_lo;
+        }
+    }
+}
+
+static int count_unique_samples(const int16_t *samples) {
+    int16_t unique[NUM_MIDIKEYS];
+    int count = 0;
+    for (int i = 0; i < NUM_MIDIKEYS; i++) {
+        int16_t val = samples[i];
+        if (val < 0) {
+            continue;
+        }
+        int found = 0;
+        for (int j = 0; j < count; j++) {
+            if (unique[j] == val) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found && count < NUM_MIDIKEYS) {
+            unique[count++] = val;
+        }
+    }
+    return count;
+}
+
 static int find_sample_in_inst_zone(struct SF2Bank *sf2, int gen_start, int gen_end) {
     for (int i = gen_start; i < gen_end; i++) {
         if (sf2->inst_gens[i].sfGenOper == GEN_SAMPLE_ID) {
@@ -643,6 +852,12 @@ static int add_sample(struct WFBBank *wfb, struct SF2Bank *sf2, int sf2_sample_i
 
     if (sf2_sample_idx < 0 || sf2_sample_idx >= sf2->sample_count) {
         return -1;
+    }
+
+    if (g_sf2_sample_map && sf2_sample_idx < g_sf2_sample_map_count) {
+        if (g_sf2_sample_map[sf2_sample_idx] >= 0) {
+            return g_sf2_sample_map[sf2_sample_idx];
+        }
     }
 
     sf2_samp = &sf2->samples[sf2_sample_idx];
@@ -756,6 +971,9 @@ static int add_sample(struct WFBBank *wfb, struct SF2Bank *sf2, int sf2_sample_i
 
         wfb->sample_count++;
         g_dedupe_alias_count++;
+        if (g_sf2_sample_map && sf2_sample_idx < g_sf2_sample_map_count) {
+            g_sf2_sample_map[sf2_sample_idx] = wfb_idx;
+        }
         free(sample_data);
         return wfb_idx;
     }
@@ -780,6 +998,49 @@ static int add_sample(struct WFBBank *wfb, struct SF2Bank *sf2, int sf2_sample_i
     wfb->total_sample_memory += info->dwSizeInBytes;
     wfb->sample_count++;
 
+    if (g_sf2_sample_map && sf2_sample_idx < g_sf2_sample_map_count) {
+        g_sf2_sample_map[sf2_sample_idx] = wfb_idx;
+    }
+
+    return wfb_idx;
+}
+
+int add_multisample_entry(struct WFBBank *wfb, const int16_t *sample_numbers,
+                          int16_t sample_count, const char *name) {
+    if (!wfb || !sample_numbers) {
+        return -1;
+    }
+
+    if (wfb->sample_count >= WF_MAX_SAMPLES) {
+        return -1;
+    }
+
+    int wfb_idx = wfb->sample_count;
+    struct WaveFrontExtendedSampleInfo *info = &wfb->samples[wfb_idx].info;
+    struct MULTISAMPLE *ms = &wfb->samples[wfb_idx].data.multisample;
+
+    memset(ms, 0, sizeof(*ms));
+    ms->nNumberOfSamples = sample_count;
+    for (int i = 0; i < NUM_MIDIKEYS; i++) {
+        ms->nSampleNumber[i] = sample_numbers[i];
+    }
+
+    info->nSampleType = WF_ST_MULTISAMPLE;
+    info->nNumber = wfb_idx;
+    if (name) {
+        safe_string_copy(info->szName, name, NAME_LENGTH);
+    } else {
+        snprintf(info->szName, NAME_LENGTH, "MS_%d", wfb_idx);
+    }
+    info->dwSampleRate = 0;
+    info->dwSizeInSamples = 0;
+    info->dwSizeInBytes = 0;
+    info->nChannel = 0;
+
+    wfb->samples[wfb_idx].pcm_data = NULL;
+    wfb->samples[wfb_idx].data_hash = 0;
+
+    wfb->sample_count++;
     return wfb_idx;
 }
 
@@ -794,6 +1055,42 @@ static int convert_preset(struct WFBBank *wfb, struct SF2Bank *sf2,
     int i;
     int preset_global_gen_start = -1;
     int preset_global_gen_end = -1;
+    struct ZoneDef {
+        int inst_global_start;
+        int inst_global_end;
+        int inst_gen_start;
+        int inst_gen_end;
+        int preset_gen_start;
+        int preset_gen_end;
+        int inst_mod_start;
+        int inst_mod_end;
+        int preset_mod_start;
+        int preset_mod_end;
+        int sample_idx;
+        uint8_t key_lo;
+        uint8_t key_hi;
+        uint8_t vel_lo;
+        uint8_t vel_hi;
+        uint8_t pan;
+        struct PATCH patch_base;
+    } zones[32];
+    int zone_count = 0;
+    struct GroupDef {
+        struct PATCH patch_base;
+        uint8_t pan;
+        uint8_t vel_lo;
+        uint8_t vel_hi;
+        int inst_mod_start;
+        int inst_mod_end;
+        int preset_mod_start;
+        int preset_mod_end;
+        int16_t sample_idx[NUM_MIDIKEYS];
+        int16_t sample_idx_r[NUM_MIDIKEYS];
+        int has_stereo;
+    } groups[16];
+    int group_count = 0;
+    int16_t preset_chorus_max = 0;
+    int16_t preset_reverb_max = 0;
 
     if (wfb->program_count >= WF_MAX_PROGRAMS) {
         return -1;
@@ -810,12 +1107,15 @@ static int convert_preset(struct WFBBank *wfb, struct SF2Bank *sf2,
     bag_end = (preset < &sf2->presets[sf2->preset_count - 1]) ?
               (preset + 1)->wPresetBagNdx : sf2->preset_bag_count;
 
-    for (i = bag_start; i < bag_end && layer_idx < NUM_LAYERS; i++) {
+    for (i = bag_start; i < bag_end; i++) {
         struct sfPresetBag *bag = &sf2->preset_bags[i];
         int gen_start = bag->wGenNdx;
         int gen_end = (i + 1 < sf2->preset_bag_count) ?
                       sf2->preset_bags[i + 1].wGenNdx : sf2->preset_gen_count;
         int instrument_idx = -1;
+        int preset_mod_start = bag->wModNdx;
+        int preset_mod_end = (i + 1 < sf2->preset_bag_count) ?
+                             sf2->preset_bags[i + 1].wModNdx : sf2->preset_mod_count;
         int j;
 
         /* Find instrument reference */
@@ -833,67 +1133,61 @@ static int convert_preset(struct WFBBank *wfb, struct SF2Bank *sf2,
             }
             continue;  /* Skip global zone or invalid */
         }
-
-        /* Create patch for this layer */
-        if (wfb->patch_count >= WF_MAX_PATCHES) {
-            break;
-        }
-
-        wf_patch = &wfb->patches[wfb->patch_count];
-        memset(wf_patch, 0, sizeof(*wf_patch));
-        wf_patch->nNumber = wfb->patch_count;
-
-        snprintf(wf_patch->szName, NAME_LENGTH, "%s_L%d",
-                 preset->achPresetName, layer_idx);
-
-        init_default_patch(&wf_patch->base);
-
-        /* Parse instrument */
         struct sfInst *inst = &sf2->instruments[instrument_idx];
         int inst_bag_start = inst->wInstBagNdx;
         int inst_bag_end = (instrument_idx + 1 < sf2->inst_count) ?
                           sf2->instruments[instrument_idx + 1].wInstBagNdx :
                           sf2->inst_bag_count;
+        int inst_global_gen_start = -1;
+        int inst_global_gen_end = -1;
+        uint8_t preset_key_lo, preset_key_hi, preset_vel_lo, preset_vel_hi;
 
-        /* Use first instrument zone */
-        if (inst_bag_start < inst_bag_end) {
-            struct sfInstBag *inst_bag = &sf2->inst_bags[inst_bag_start];
+        get_key_range_preset(sf2->preset_gens, gen_start, gen_end,
+                             &preset_key_lo, &preset_key_hi);
+        get_vel_range_preset(sf2->preset_gens, gen_start, gen_end,
+                             &preset_vel_lo, &preset_vel_hi);
+
+        for (int ib = inst_bag_start; ib < inst_bag_end; ib++) {
+            struct sfInstBag *inst_bag = &sf2->inst_bags[ib];
             int inst_gen_start = inst_bag->wInstGenNdx;
-            int inst_gen_end = (inst_bag_start + 1 < sf2->inst_bag_count) ?
-                              sf2->inst_bags[inst_bag_start + 1].wInstGenNdx :
+            int inst_gen_end = (ib + 1 < sf2->inst_bag_count) ?
+                              sf2->inst_bags[ib + 1].wInstGenNdx :
                               sf2->inst_gen_count;
-            int sample_idx = -1;
-            int has_sample = 0;
-            int inst_global_gen_start = -1;
-            int inst_global_gen_end = -1;
+            int sample_idx = find_sample_in_inst_zone(sf2, inst_gen_start, inst_gen_end);
+            uint8_t inst_key_lo, inst_key_hi, inst_vel_lo, inst_vel_hi;
 
-            /* Find sample */
-            for (j = inst_gen_start; j < inst_gen_end; j++) {
-                if (sf2->inst_gens[j].sfGenOper == GEN_SAMPLE_ID) {
-                    sample_idx = sf2->inst_gens[j].genAmount.wAmount;
-                    has_sample = 1;
-                    break;
-                }
-            }
-
-            if (!has_sample && inst_bag_start + 1 < inst_bag_end) {
+            if (sample_idx < 0 && inst_global_gen_start < 0) {
                 inst_global_gen_start = inst_gen_start;
                 inst_global_gen_end = inst_gen_end;
-                inst_bag = &sf2->inst_bags[inst_bag_start + 1];
-                inst_gen_start = inst_bag->wInstGenNdx;
-                inst_gen_end = (inst_bag_start + 2 < sf2->inst_bag_count) ?
-                              sf2->inst_bags[inst_bag_start + 2].wInstGenNdx :
-                              sf2->inst_gen_count;
-                for (j = inst_gen_start; j < inst_gen_end; j++) {
-                    if (sf2->inst_gens[j].sfGenOper == GEN_SAMPLE_ID) {
-                        sample_idx = sf2->inst_gens[j].genAmount.wAmount;
-                        break;
-                    }
-                }
+                continue;
+            }
+
+            if (sample_idx < 0) {
+                continue;
+            }
+
+            get_key_range_inst(sf2->inst_gens, inst_gen_start, inst_gen_end,
+                               &inst_key_lo, &inst_key_hi);
+            get_vel_range_inst(sf2->inst_gens, inst_gen_start, inst_gen_end,
+                               &inst_vel_lo, &inst_vel_hi);
+
+            uint8_t key_lo = (preset_key_lo > inst_key_lo) ? preset_key_lo : inst_key_lo;
+            uint8_t key_hi = (preset_key_hi < inst_key_hi) ? preset_key_hi : inst_key_hi;
+            uint8_t vel_lo = (preset_vel_lo > inst_vel_lo) ? preset_vel_lo : inst_vel_lo;
+            uint8_t vel_hi = (preset_vel_hi < inst_vel_hi) ? preset_vel_hi : inst_vel_hi;
+
+            if (key_lo > key_hi || vel_lo > vel_hi) {
+                continue;
+            }
+
+            if (zone_count >= (int)(sizeof(zones) / sizeof(zones[0]))) {
+                break;
             }
 
             {
                 struct Sf2GenState gen_state;
+                struct PATCH temp_patch;
+
                 sf2_gen_defaults(&gen_state);
                 if (inst_global_gen_start >= 0) {
                     sf2_apply_generators(&gen_state, sf2->inst_gens,
@@ -907,71 +1201,260 @@ static int convert_preset(struct WFBBank *wfb, struct SF2Bank *sf2,
                 }
                 sf2_apply_preset_generators(&gen_state, sf2->preset_gens,
                                             gen_start, gen_end, 1);
-                apply_sf2_state_to_patch(&wf_patch->base, &gen_state);
+
+                init_default_patch(&temp_patch);
+                apply_sf2_state_to_patch(&temp_patch, &gen_state);
+                temp_patch.bySampleNumber = 0;
+                temp_patch.fSampleMSB = 0;
+
+                zones[zone_count].pan = sf2_pan_to_wf(gen_state.pan);
+                zones[zone_count].patch_base = temp_patch;
+
+                if (gen_state.chorus_send > preset_chorus_max) {
+                    preset_chorus_max = gen_state.chorus_send;
+                }
+                if (gen_state.reverb_send > preset_reverb_max) {
+                    preset_reverb_max = gen_state.reverb_send;
+                }
             }
 
-            /* Add sample (with stereo pairing if linked) */
-            if (sample_idx >= 0) {
-                int left_idx = -1;
-                int right_idx = -1;
-                int is_stereo = sf2_find_stereo_pair(sf2, sample_idx, &left_idx, &right_idx);
-                if (is_stereo && layer_idx + 1 < NUM_LAYERS &&
-                    wfb->patch_count + 1 < WF_MAX_PATCHES) {
-                    int left_wfb = add_sample(wfb, sf2, left_idx, resampled_count);
-                    int right_wfb = add_sample(wfb, sf2, right_idx, resampled_count);
-                    if (left_wfb >= 0 && right_wfb >= 0) {
-                        wf_patch->base.bySampleNumber = left_wfb;
+            zones[zone_count].inst_global_start = inst_global_gen_start;
+            zones[zone_count].inst_global_end = inst_global_gen_end;
+            zones[zone_count].inst_gen_start = inst_gen_start;
+            zones[zone_count].inst_gen_end = inst_gen_end;
+            zones[zone_count].preset_gen_start = gen_start;
+            zones[zone_count].preset_gen_end = gen_end;
+            zones[zone_count].inst_mod_start = inst_bag->wInstModNdx;
+            zones[zone_count].inst_mod_end = (ib + 1 < sf2->inst_bag_count) ?
+                                             sf2->inst_bags[ib + 1].wInstModNdx :
+                                             sf2->inst_mod_count;
+            zones[zone_count].preset_mod_start = preset_mod_start;
+            zones[zone_count].preset_mod_end = preset_mod_end;
+            zones[zone_count].sample_idx = sample_idx;
+            zones[zone_count].key_lo = key_lo;
+            zones[zone_count].key_hi = key_hi;
+            zones[zone_count].vel_lo = vel_lo;
+            zones[zone_count].vel_hi = vel_hi;
+            zone_count++;
+        }
+    }
 
-                        struct LAYER *layer_l = &wf_prog->base.layer[layer_idx];
-                        layer_l->byPatchNumber = wfb->patch_count;
-                        layer_l->fMixLevel = 127;
-                        layer_l->fUnmute = 1;
-                        layer_l->fSplitPoint = 0;
-                        layer_l->fPan = 0;
+    for (int z = 0; z < zone_count; z++) {
+        int left_idx = -1;
+        int right_idx = -1;
+        int sample_left = zones[z].sample_idx;
+        int sample_right = -1;
 
-                        wfb->patch_count++;
-                        layer_idx++;
+        if (sf2_find_stereo_pair(sf2, zones[z].sample_idx, &left_idx, &right_idx)) {
+            sample_left = left_idx;
+            sample_right = right_idx;
+        }
 
-                        struct WaveFrontPatch *wf_patch_r = &wfb->patches[wfb->patch_count];
-                        memset(wf_patch_r, 0, sizeof(*wf_patch_r));
-                        wf_patch_r->nNumber = wfb->patch_count;
-                        snprintf(wf_patch_r->szName, NAME_LENGTH, "%s_L%dR",
-                                 preset->achPresetName, layer_idx);
-                        wf_patch_r->base = wf_patch->base;
-                        wf_patch_r->base.bySampleNumber = right_wfb;
+        int group_idx = -1;
+        for (int g = 0; g < group_count; g++) {
+            if (groups[g].pan == zones[z].pan &&
+                groups[g].vel_lo == zones[z].vel_lo &&
+                groups[g].vel_hi == zones[z].vel_hi &&
+                patch_base_equal(&groups[g].patch_base, &zones[z].patch_base)) {
+                group_idx = g;
+                break;
+            }
+        }
 
-                        struct LAYER *layer_r = &wf_prog->base.layer[layer_idx];
-                        layer_r->byPatchNumber = wfb->patch_count;
-                        layer_r->fMixLevel = 127;
-                        layer_r->fUnmute = 1;
-                        layer_r->fSplitPoint = 0;
-                        layer_r->fPan = 7;
+        if (group_idx < 0) {
+            if (group_count >= (int)(sizeof(groups) / sizeof(groups[0]))) {
+                continue;
+            }
+            group_idx = group_count++;
+            groups[group_idx].patch_base = zones[z].patch_base;
+            groups[group_idx].pan = zones[z].pan;
+            groups[group_idx].vel_lo = zones[z].vel_lo;
+            groups[group_idx].vel_hi = zones[z].vel_hi;
+            groups[group_idx].inst_mod_start = zones[z].inst_mod_start;
+            groups[group_idx].inst_mod_end = zones[z].inst_mod_end;
+            groups[group_idx].preset_mod_start = zones[z].preset_mod_start;
+            groups[group_idx].preset_mod_end = zones[z].preset_mod_end;
+            groups[group_idx].has_stereo = 0;
+            for (int k = 0; k < NUM_MIDIKEYS; k++) {
+                groups[group_idx].sample_idx[k] = -1;
+                groups[group_idx].sample_idx_r[k] = -1;
+            }
+        }
 
-                        wfb->patch_count++;
-                        layer_idx++;
-                        continue;
-                    }
-                }
+        for (int key = zones[z].key_lo; key <= zones[z].key_hi; key++) {
+            groups[group_idx].sample_idx[key] = sample_left;
+            if (sample_right >= 0) {
+                groups[group_idx].sample_idx_r[key] = sample_right;
+                groups[group_idx].has_stereo = 1;
+            }
+        }
+    }
 
-                {
-                    int wfb_sample_idx = add_sample(wfb, sf2, sample_idx, resampled_count);
-                    if (wfb_sample_idx >= 0) {
-                        wf_patch->base.bySampleNumber = wfb_sample_idx;
-                    }
+    int dropped_groups = 0;
+    int drop_reason = 0;
+    for (int g = 0; g < group_count; g++) {
+        if (layer_idx >= NUM_LAYERS) {
+            dropped_groups = group_count - g;
+            drop_reason = 1;
+            break;
+        }
+        int patch_limit = WF_MAX_PATCHES - g_patch_reserve;
+        if (patch_limit < 0) {
+            patch_limit = 0;
+        }
+        if (wfb->patch_count >= patch_limit) {
+            dropped_groups = group_count - g;
+            drop_reason = 2;
+            break;
+        }
+
+        int has_right = groups[g].has_stereo;
+        if (has_right) {
+            for (int k = 0; k < NUM_MIDIKEYS; k++) {
+                if (groups[g].sample_idx[k] >= 0 &&
+                    groups[g].sample_idx_r[k] < 0) {
+                    has_right = 0;
+                    break;
                 }
             }
         }
 
-        /* Setup layer (mono) */
-        {
-            struct LAYER *layer = &wf_prog->base.layer[layer_idx];
-            layer->byPatchNumber = wfb->patch_count;
-            layer->fMixLevel = 127;
-            layer->fUnmute = 1;
-            layer->fSplitPoint = 0;
-            layer->fPan = 7;  /* Center */
-            wfb->patch_count++;
-            layer_idx++;
+        int16_t ms_numbers[NUM_MIDIKEYS];
+        int16_t ms_numbers_r[NUM_MIDIKEYS];
+        int mapped_keys = 0;
+        int mapped_keys_r = 0;
+        for (int k = 0; k < NUM_MIDIKEYS; k++) {
+            ms_numbers[k] = -1;
+            ms_numbers_r[k] = -1;
+            if (groups[g].sample_idx[k] >= 0) {
+                int wfb_idx = add_sample(wfb, sf2, groups[g].sample_idx[k], resampled_count);
+                if (wfb_idx >= 0) {
+                    ms_numbers[k] = (int16_t)wfb_idx;
+                    mapped_keys++;
+                }
+            }
+            if (has_right && groups[g].sample_idx_r[k] >= 0) {
+                int wfb_idx = add_sample(wfb, sf2, groups[g].sample_idx_r[k], resampled_count);
+                if (wfb_idx >= 0) {
+                    ms_numbers_r[k] = (int16_t)wfb_idx;
+                    mapped_keys_r++;
+                }
+            }
+        }
+
+        if (mapped_keys == 0) {
+            continue;
+        }
+
+        int unique = count_unique_samples(ms_numbers);
+        int need_multisample = (unique > 1) || (mapped_keys < NUM_MIDIKEYS);
+        int16_t sample_ref = -1;
+        if (need_multisample) {
+            char ms_name[NAME_LENGTH];
+            snprintf(ms_name, NAME_LENGTH, "%s_MS%d", preset->achPresetName, g);
+            sample_ref = add_multisample_entry(wfb, ms_numbers, (int16_t)unique, ms_name);
+        } else {
+            for (int k = 0; k < NUM_MIDIKEYS; k++) {
+                if (ms_numbers[k] >= 0) {
+                    sample_ref = ms_numbers[k];
+                    break;
+                }
+            }
+        }
+
+        if (sample_ref < 0) {
+            continue;
+        }
+
+        wf_patch = &wfb->patches[wfb->patch_count];
+        memset(wf_patch, 0, sizeof(*wf_patch));
+        wf_patch->nNumber = wfb->patch_count;
+        snprintf(wf_patch->szName, NAME_LENGTH, "%s_G%d",
+                 preset->achPresetName, g);
+        wf_patch->base = groups[g].patch_base;
+        apply_modulator_list_to_patch(&wf_patch->base,
+                                      (const struct sfModList *)sf2->inst_mods,
+                                      groups[g].inst_mod_start, groups[g].inst_mod_end);
+        apply_modulator_list_to_patch(&wf_patch->base,
+                                      sf2->preset_mods,
+                                      groups[g].preset_mod_start, groups[g].preset_mod_end);
+        wf_patch->base.bySampleNumber = (uint8_t)sample_ref;
+
+        struct LAYER *layer = &wf_prog->base.layer[layer_idx];
+        layer->byPatchNumber = wfb->patch_count;
+        layer->fMixLevel = 127;
+        layer->fUnmute = 1;
+        layer->fPan = groups[g].pan;
+        apply_layer_split(layer, 0, 127, groups[g].vel_lo, groups[g].vel_hi);
+        wfb->patch_count++;
+        layer_idx++;
+
+        if (has_right && layer_idx < NUM_LAYERS && wfb->patch_count < patch_limit) {
+            int unique_r = count_unique_samples(ms_numbers_r);
+            int need_multisample_r = (unique_r > 1) || (mapped_keys_r < NUM_MIDIKEYS);
+            int16_t sample_ref_r = -1;
+            if (need_multisample_r) {
+                char ms_name_r[NAME_LENGTH];
+                snprintf(ms_name_r, NAME_LENGTH, "%s_MS%dR", preset->achPresetName, g);
+                sample_ref_r = add_multisample_entry(wfb, ms_numbers_r, (int16_t)unique_r, ms_name_r);
+            } else {
+                for (int k = 0; k < NUM_MIDIKEYS; k++) {
+                    if (ms_numbers_r[k] >= 0) {
+                        sample_ref_r = ms_numbers_r[k];
+                        break;
+                    }
+                }
+            }
+
+            if (sample_ref_r >= 0) {
+                struct WaveFrontPatch *wf_patch_r = &wfb->patches[wfb->patch_count];
+                memset(wf_patch_r, 0, sizeof(*wf_patch_r));
+                wf_patch_r->nNumber = wfb->patch_count;
+                snprintf(wf_patch_r->szName, NAME_LENGTH, "%s_G%dR",
+                         preset->achPresetName, g);
+                wf_patch_r->base = groups[g].patch_base;
+                apply_modulator_list_to_patch(&wf_patch_r->base,
+                                              (const struct sfModList *)sf2->inst_mods,
+                                              groups[g].inst_mod_start, groups[g].inst_mod_end);
+                apply_modulator_list_to_patch(&wf_patch_r->base,
+                                              sf2->preset_mods,
+                                              groups[g].preset_mod_start, groups[g].preset_mod_end);
+                wf_patch_r->base.bySampleNumber = (uint8_t)sample_ref_r;
+
+                struct LAYER *layer_r = &wf_prog->base.layer[layer_idx];
+                layer_r->byPatchNumber = wfb->patch_count;
+                layer_r->fMixLevel = 127;
+                layer_r->fUnmute = 1;
+                layer_r->fPan = 7;
+                apply_layer_split(layer_r, 0, 127, groups[g].vel_lo, groups[g].vel_hi);
+                wfb->patch_count++;
+                layer_idx++;
+            }
+        }
+    }
+
+    if (g_verbose && dropped_groups > 0) {
+        if (drop_reason == 1) {
+            fprintf(stderr,
+                    "Warning: Program %d (\"%s\") has %d zone groups; only %d layers available. %d group(s) dropped.\n",
+                    prog_num, preset->achPresetName, group_count, NUM_LAYERS, dropped_groups);
+        } else if (drop_reason == 2) {
+            fprintf(stderr,
+                    "Warning: Program %d (\"%s\") dropped %d zone group(s) due to patch limit (%d).\n",
+                    prog_num, preset->achPresetName, dropped_groups, WF_MAX_PATCHES - g_patch_reserve);
+        }
+    }
+
+    if (g_verbose) {
+        if (preset_chorus_max > 0) {
+            fprintf(stderr,
+                    "Notice: Program %d (\"%s\") chorus send up to %.1f%% (SF2).\n",
+                    prog_num, preset->achPresetName, preset_chorus_max / 10.0f);
+        }
+        if (preset_reverb_max > 0) {
+            fprintf(stderr,
+                    "Notice: Program %d (\"%s\") reverb send up to %.1f%% (SF2).\n",
+                    prog_num, preset->achPresetName, preset_reverb_max / 10.0f);
         }
     }
 
@@ -1161,15 +1644,40 @@ int convert_sf2_to_wfb(const char *input_file, const char *output_file,
     int discarded_samples = 0;
     uint32_t memory_limit;
 
+    g_verbose = (opts && opts->verbose) ? 1 : 0;
+
     /* Open SF2 file */
     if (sf2_open(input_file, &sf2) != 0) {
         return -1;
+    }
+
+    g_sf2_sample_map = malloc((size_t)sf2.sample_count * sizeof(int));
+    if (g_sf2_sample_map) {
+        g_sf2_sample_map_count = sf2.sample_count;
+        for (i = 0; i < g_sf2_sample_map_count; i++) {
+            g_sf2_sample_map[i] = -1;
+        }
+    } else {
+        g_sf2_sample_map_count = 0;
     }
 
     /* Initialize WFB bank */
     init_wfb_bank(&wfb, opts->device_name ? opts->device_name : "Maui");
 
     /* Convert Bank 0 (melodic programs 0-127) */
+    if (!opts->drums_file) {
+        struct sfPresetHeader *drums_probe = sf2_get_preset(&sf2, 128, 0);
+        if (!drums_probe) {
+            drums_probe = sf2_get_preset(&sf2, 0, 128);
+        }
+        if (drums_probe) {
+            g_patch_reserve = 47; /* Reserve for Drumkit keys 35-81 */
+        } else {
+            g_patch_reserve = 0;
+        }
+    } else {
+        g_patch_reserve = 0;
+    }
     for (i = 0; i < 128; i++) {
         struct sfPresetHeader *preset = sf2_get_preset(&sf2, 0, i);
         if (preset) {
@@ -1245,6 +1753,10 @@ int convert_sf2_to_wfb(const char *input_file, const char *output_file,
     for (i = 0; i < wfb.sample_count; i++) {
         free(wfb.samples[i].pcm_data);
     }
+    free(g_sf2_sample_map);
+    g_sf2_sample_map = NULL;
+    g_sf2_sample_map_count = 0;
+    g_verbose = 0;
 
     return 0;
 }

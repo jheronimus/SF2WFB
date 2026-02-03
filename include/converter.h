@@ -15,6 +15,7 @@ struct ConversionOptions {
     const char *drums_file;         /* Optional drum kit SF2 file */
     const char *output_file;        /* Explicit output filename */
     int patch_count;                /* Number of patches to apply */
+    int verbose;                    /* Verbose logging */
     struct {
         const char *file;           /* SF2 file for patch */
         int program_id;             /* Program ID to replace (0-127) */
@@ -104,6 +105,8 @@ void resample_scale_loop_points(uint32_t input_rate, uint32_t output_rate,
                                 uint32_t output_samples,
                                 struct SAMPLE_OFFSET *out_start,
                                 struct SAMPLE_OFFSET *out_end);
+int add_multisample_entry(struct WFBBank *wfb, const int16_t *sample_numbers,
+                          int16_t sample_count, const char *name);
 
 /* Utility */
 const char *get_auto_increment_filename(const char *base_path);
