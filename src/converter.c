@@ -800,7 +800,8 @@ static int add_sample(struct WFBBank *wfb, struct SF2Bank *sf2, int sf2_sample_i
         temp_sample.fLoop = 1;
     }
 
-    temp_sample.nFrequencyBias = cents_to_freq_bias(sf2_samp->chPitchCorrection);
+    /* nFrequencyBias must be big-endian for WaveFront hardware (Motorola 68000 based) */
+    temp_sample.nFrequencyBias = swap16(cents_to_freq_bias(sf2_samp->chPitchCorrection));
     temp_sample.fSampleResolution = LINEAR_16BIT;
 
     uint32_t channel = WF_CH_MONO;

@@ -173,7 +173,7 @@ struct SAMPLE {
     struct SAMPLE_OFFSET loopStartOffset;
     struct SAMPLE_OFFSET loopEndOffset;
     struct SAMPLE_OFFSET sampleEndOffset;
-    int16_t nFrequencyBias;
+    int16_t nFrequencyBias;         /* ** MOTOROLA FORMAT (BIG ENDIAN) ** */
     BYTE fSampleResolution:2;
     BYTE fUnused1:1;
     BYTE fLoop:1;
@@ -194,7 +194,7 @@ struct ALIAS {
     struct SAMPLE_OFFSET loopStartOffset;
     struct SAMPLE_OFFSET sampleEndOffset;
     struct SAMPLE_OFFSET loopEndOffset;
-    int16_t nFrequencyBias;
+    int16_t nFrequencyBias;         /* ** MOTOROLA FORMAT (BIG ENDIAN) ** */
     BYTE fSampleResolution:2;
     BYTE fUnused1:1;
     BYTE fLoop:1;
