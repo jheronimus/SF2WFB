@@ -6,6 +6,7 @@
  */
 
 #include "../include/converter.h"
+#include "../include/viability.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,7 +29,9 @@ static void print_usage(const char *prog_name) {
     printf("  -p, --patch <file>:<id>  Replace program ID with preset from file\n");
     printf("                           Can be used multiple times\n");
     printf("  -o, --output <path>      Output filename (single file only)\n");
-    printf("  -v, --verbose            Enable verbose warnings\n");
+    printf("  -v, --verbose            Enable verbose warnings and detailed assessment\n");
+    printf("  -y, --yes                Skip assessment prompt, always proceed\n");
+    printf("      --no-assess          Skip viability assessment entirely\n");
     printf("  -h, --help               Show this help message\n");
     printf("\nExamples:\n");
     printf("  %s piano.sf2\n", prog_name);
@@ -123,6 +126,7 @@ static const char *get_output_filename(const char *input, const char *explicit_o
 
 /* Process a single file */
 static int process_file(const char *filename, struct ConversionOptions *opts,
+                       int assess, int interactive,
                        int *converted, int *failed) {
     int result = 0;
 
@@ -130,6 +134,45 @@ static int process_file(const char *filename, struct ConversionOptions *opts,
         /* Conversion mode */
         const char *output = get_output_filename(filename, opts->output_file);
         const char *device = opts->device_name ? opts->device_name : "Maui";
+
+        /* Viability assessment */
+        if (assess) {
+            struct ViabilityReport report;
+            struct ViabilityConfig config = {
+                .verbose = opts->verbose,
+                .interactive = interactive,
+                .auto_yes = !interactive
+            };
+
+            printf("Assessing conversion viability for: %s\n\n", filename);
+
+            if (assess_sf2_viability(filename, &report, &config) != 0) {
+                fprintf(stderr, "Error: Assessment failed\n");
+                (*failed)++;
+                return -1;
+            }
+
+            /* Print report */
+            if (opts->verbose) {
+                print_viability_verbose(&report);
+            } else {
+                print_viability_summary(&report);
+            }
+
+            /* Prompt user if interactive and warnings exist */
+            if (interactive && report.warning_count > 0) {
+                if (!prompt_user_proceed(&report)) {
+                    printf("Conversion cancelled.\n");
+                    free_viability_report(&report);
+                    return 0;  /* Not a failure, user chose to cancel */
+                }
+            }
+
+            free_viability_report(&report);
+            printf("\n");
+        }
+
+        /* Proceed with conversion */
         printf("Converting: %s -> %s\n", filename, output);
 
         /* Set device name for conversion if not specified */
@@ -185,12 +228,14 @@ int main(int argc, char *argv[]) {
     int i;
 
     static struct option long_options[] = {
-        {"device",  required_argument, 0, 'd'},
-        {"drums",   required_argument, 0, 'D'},
-        {"patch",   required_argument, 0, 'p'},
-        {"output",  required_argument, 0, 'o'},
-        {"verbose", no_argument,       0, 'v'},
-        {"help",    no_argument,       0, 'h'},
+        {"device",     required_argument, 0, 'd'},
+        {"drums",      required_argument, 0, 'D'},
+        {"patch",      required_argument, 0, 'p'},
+        {"output",     required_argument, 0, 'o'},
+        {"verbose",    no_argument,       0, 'v'},
+        {"yes",        no_argument,       0, 'y'},
+        {"no-assess",  no_argument,       0, 1000},
+        {"help",       no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
@@ -198,8 +243,12 @@ int main(int argc, char *argv[]) {
     memset(&opts, 0, sizeof(opts));
     opts.device_name = NULL;  /* Default - will be set to Maui for conversions */
 
+    /* Assessment flags (local to main) */
+    int assess_viability = 1;      /* Default: always assess */
+    int interactive_prompt = 1;    /* Default: prompt if warnings */
+
     /* Parse command-line arguments */
-    while ((opt = getopt_long(argc, argv, "d:D:p:o:vh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:D:p:o:vyh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'd':
                 if (!is_valid_device_name(optarg)) {
@@ -244,6 +293,14 @@ int main(int argc, char *argv[]) {
                 opts.verbose = 1;
                 break;
 
+            case 'y':
+                interactive_prompt = 0;  /* Skip prompt, always proceed */
+                break;
+
+            case 1000:  /* --no-assess */
+                assess_viability = 0;
+                break;
+
             case 'o':
                 opts.output_file = optarg;
                 break;
@@ -285,12 +342,14 @@ int main(int argc, char *argv[]) {
         if (glob(pattern, GLOB_TILDE, NULL, &globbuf) == 0) {
             size_t j;
             for (j = 0; j < globbuf.gl_pathc; j++) {
-                process_file(globbuf.gl_pathv[j], &opts, &converted, &failed);
+                process_file(globbuf.gl_pathv[j], &opts, assess_viability,
+                            interactive_prompt, &converted, &failed);
             }
             globfree(&globbuf);
         } else {
             /* No matches, try as literal filename */
-            process_file(pattern, &opts, &converted, &failed);
+            process_file(pattern, &opts, assess_viability, interactive_prompt,
+                        &converted, &failed);
         }
     }
 
